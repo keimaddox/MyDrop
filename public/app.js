@@ -206,8 +206,6 @@ function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const params = new URLSearchParams();
   if (currentRoom) params.set("room", currentRoom);
-  if (myId) params.set("id", myId);
-  if (myName) params.set("name", myName);
   const qs = params.toString();
   const socket = new WebSocket(`${proto}://${location.host}/ws${qs ? "?" + qs : ""}`);
   ws = socket;
