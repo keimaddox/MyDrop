@@ -1,19 +1,31 @@
 // ================= Security Configuration & Configurable Limits =================
 const SECURITY_LIMITS = {
   MAX_FILES_PER_TRANSFER: 10,
-  MAX_FILE_SIZE: 50 * 1024 * 1024,        // 50 MB per file
-  MAX_TOTAL_TRANSFER_SIZE: 100 * 1024 * 1024, // 100 MB total per transfer
-  MAX_TEXT_BYTES: 16 * 1024,              // 16 KB per text message
-  MAX_PENDING_REQUESTS: 5,                // Max 5 pending incoming file requests
-  MAX_FILENAME_LENGTH: 255,               // Max 255 characters per filename
-  MAX_CHUNK_SIZE: 64 * 1024,              // Max 64 KB plaintext chunk size
-  REQUEST_TIMEOUT_MS: 60000,              // 60s timeout for recipient approval
-  CHUNK_INACTIVITY_TIMEOUT_MS: 30000,     // 30s inactivity timeout during active file reception
-  E2EE_HANDSHAKE_TIMEOUT_MS: 8000,        // 8s timeout for ECDH key exchange
-  MAX_SEEN_REQUEST_IDS: 500,              // Bounded replay cache size
-  MAX_RETAINED_BLOBS: 25,                 // Max retained Object URLs before auto-revoking oldest
-  MAX_RECEIVED_ITEMS: 50,                 // Max retained DOM items in #received inbox
-  MAX_CLIENT_CTRL_PER_10S: 60,            // Max incoming decrypted control/text messages per peer per 10s
+  MAX_FILE_SIZE: 5 * 1024 * 1024 * 1024,        // 5 GB per file (P2P target)
+  MAX_TOTAL_TRANSFER_SIZE: 10 * 1024 * 1024 * 1024, // 10 GB total per transfer (P2P)
+  MAX_RELAY_FILE_SIZE: 500 * 1024 * 1024,       // 500 MB max per file over DO WebSocket Relay fallback
+  MAX_RELAY_TOTAL_SIZE: 500 * 1024 * 1024,      // 500 MB max total over DO WebSocket Relay fallback
+  INITIAL_CHUNK_SIZE: 1 * 1024 * 1024,          // 1 MB initial logical chunk size (adapts 1-4 MB)
+  MIN_CHUNK_SIZE: 256 * 1024,                   // 256 KB minimum adaptive P2P chunk size
+  MAX_CHUNK_SIZE: 4 * 1024 * 1024,              // 4 MB maximum logical chunk size
+  RELAY_CHUNK_SIZE: 64 * 1024,                  // 64 KB plaintext chunk over WebSocket Relay (< 128 KB DO frame limit)
+  SCTP_SAFE_FRAME_SIZE: 64 * 1024,              // 64 KB SCTP sub-frame payload for cross-browser iOS/Android DataChannels
+  MAX_IN_FLIGHT_BYTES: 16 * 1024 * 1024,        // 16 MB max unacknowledged in-flight bytes on sender (receiver backpressure)
+  STORAGE_COMPACT_THRESHOLD: 8 * 1024 * 1024,   // 8 MB compaction threshold when OPFS is unavailable
+  INTEGRITY_BLOCK_SIZE: 1 * 1024 * 1024,        // 1 MB block size for hardware-accelerated streaming SHA-256
+  MAX_OUT_OF_ORDER_CHUNKS: 8,                   // Max buffered out-of-order chunks during missing chunk retransmission
+  MAX_TEXT_BYTES: 16 * 1024,                    // 16 KB per text message
+  MAX_PENDING_REQUESTS: 5,                      // Max 5 pending incoming file requests
+  MAX_FILENAME_LENGTH: 255,                     // Max 255 characters per filename
+  REQUEST_TIMEOUT_MS: 60000,                    // 60s timeout for recipient approval
+  CHUNK_INACTIVITY_TIMEOUT_MS: 45000,           // 45s inactivity timeout during active file reception
+  RESUME_TIMEOUT_MS: 30000,                     // 30s window to reconnect and resume an interrupted transfer
+  PAUSE_TIMEOUT_MS: 300000,                     // 5 min timeout while transfer is explicitly paused
+  E2EE_HANDSHAKE_TIMEOUT_MS: 8000,              // 8s timeout for ECDH key exchange
+  MAX_SEEN_REQUEST_IDS: 500,                    // Bounded replay cache size
+  MAX_RETAINED_BLOBS: 25,                       // Max retained Object URLs before auto-revoking oldest
+  MAX_RECEIVED_ITEMS: 50,                       // Max retained DOM items in #received inbox
+  MAX_CLIENT_CTRL_PER_10S: 250,                 // Max incoming decrypted control/ack messages per peer per 10s
   ROOM_CODE_MIN_LEN: 3,
   ROOM_CODE_MAX_LEN: 64,
   ...(typeof window !== "undefined" &&
@@ -189,7 +201,7 @@ function getSafeDownloadMime(filename, rawMime) {
   return mime;
 }
 
-function validateOutgoingFiles(files) {
+function validateOutgoingFiles(files, transportMode = "p2p") {
   if (!Array.isArray(files) || files.length === 0) {
     return { ok: false, error: "กรุณาเลือกไฟล์ก่อนส่ง" };
   }
@@ -199,29 +211,41 @@ function validateOutgoingFiles(files) {
       error: `ส่งได้สูงสุด ${SECURITY_LIMITS.MAX_FILES_PER_TRANSFER} ไฟล์ต่อครั้ง`,
     };
   }
+  const isRelay = transportMode === "relay";
+  const maxFileLimit = isRelay
+    ? Math.min(SECURITY_LIMITS.MAX_FILE_SIZE, SECURITY_LIMITS.MAX_RELAY_FILE_SIZE)
+    : SECURITY_LIMITS.MAX_FILE_SIZE;
+  const maxTotalLimit = isRelay
+    ? Math.min(SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE, SECURITY_LIMITS.MAX_RELAY_TOTAL_SIZE)
+    : SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE;
+
   let totalBytes = 0;
   for (const f of files) {
     if (!(f instanceof Blob) || typeof f.size !== "number" || f.size < 0 || !Number.isSafeInteger(f.size)) {
       return { ok: false, error: "ข้อมูลไฟล์ไม่ถูกต้อง" };
     }
-    if (f.size > SECURITY_LIMITS.MAX_FILE_SIZE) {
+    if (f.size > maxFileLimit) {
       return {
         ok: false,
-        error: `ไฟล์ "${sanitizeFilename(f.name)}" มีขนาดเกิน ${formatSize(SECURITY_LIMITS.MAX_FILE_SIZE)}`,
+        error: isRelay
+          ? `โหมด Relay รองรับไฟล์ขนาดสูงสุด ${formatSize(maxFileLimit)} ต่อไฟล์ (ไฟล์ "${sanitizeFilename(f.name)}" มีขนาด ${formatSize(f.size)} กรุณาเชื่อมต่อผ่าน WebRTC P2P หรือ TURN)`
+          : `ไฟล์ "${sanitizeFilename(f.name)}" มีขนาดเกิน ${formatSize(maxFileLimit)}`,
       };
     }
     totalBytes += f.size;
-    if (totalBytes > SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE) {
+    if (totalBytes > maxTotalLimit) {
       return {
         ok: false,
-        error: `ขนาดไฟล์รวมเกินขีดจำกัด (${formatSize(SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE)} ต่อครั้ง)`,
+        error: isRelay
+          ? `โหมด Relay รองรับขนาดไฟล์รวมสูงสุด ${formatSize(maxTotalLimit)} ต่อครั้ง`
+          : `ขนาดไฟล์รวมเกินขีดจำกัด (${formatSize(maxTotalLimit)} ต่อครั้ง)`,
       };
     }
   }
   return { ok: true, totalBytes };
 }
 
-function validateIncomingFileRequest(msg) {
+function validateIncomingFileRequest(msg, transportMode = "p2p") {
   if (!msg || typeof msg !== "object") return { ok: false, error: "Invalid request" };
   if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) {
     return { ok: false, error: "Invalid transferId" };
@@ -229,6 +253,14 @@ function validateIncomingFileRequest(msg) {
   if (!Array.isArray(msg.files) || msg.files.length === 0 || msg.files.length > SECURITY_LIMITS.MAX_FILES_PER_TRANSFER) {
     return { ok: false, error: "Invalid file count" };
   }
+
+  const isRelay = transportMode === "relay" || msg.transportMode === "relay";
+  const maxFileLimit = isRelay
+    ? Math.min(SECURITY_LIMITS.MAX_FILE_SIZE, SECURITY_LIMITS.MAX_RELAY_FILE_SIZE)
+    : SECURITY_LIMITS.MAX_FILE_SIZE;
+  const maxTotalLimit = isRelay
+    ? Math.min(SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE, SECURITY_LIMITS.MAX_RELAY_TOTAL_SIZE)
+    : SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE;
 
   const sanitizedFiles = [];
   let totalBytes = 0;
@@ -242,12 +274,12 @@ function validateIncomingFileRequest(msg) {
       typeof rawFile.size !== "number" ||
       !Number.isSafeInteger(rawFile.size) ||
       rawFile.size < 0 ||
-      rawFile.size > SECURITY_LIMITS.MAX_FILE_SIZE
+      rawFile.size > maxFileLimit
     ) {
-      return { ok: false, error: "Invalid file size" };
+      return { ok: false, error: isRelay ? "File size exceeds Relay limit" : "Invalid file size" };
     }
     totalBytes += rawFile.size;
-    if (totalBytes > SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE) {
+    if (totalBytes > maxTotalLimit) {
       return { ok: false, error: "Total transfer size exceeded" };
     }
     const cleanName = sanitizeFilename(rawFile.name);
@@ -455,13 +487,390 @@ $("#historyBtn").onclick = () => {
 };
 
 // ================= State & Memory Cleanup =================
+const activeOutgoingTransfers = new Map(); // transferId -> outgoing transfer controller state
+const sctpFragAssemblers = new Map();      // peerId -> { fileIndex, chunkIndex, totalFrags, nextFrag, chunks, totalBytes, timer }
+const peerRxQueues = new Map();            // peerId -> Promise chain serializing async WebCrypto & OPFS storage operations
+let activeWakeLock = null;
+
+function enqueuePeerRx(peerId, taskFn) {
+  const prev = peerRxQueues.get(peerId) || Promise.resolve();
+  const next = prev.then(taskFn, taskFn);
+  peerRxQueues.set(peerId, next);
+  next.finally(() => {
+    if (peerRxQueues.get(peerId) === next) {
+      peerRxQueues.delete(peerId);
+    }
+  });
+  return next;
+}
+
+async function acquireWakeLock() {
+  try {
+    if (typeof navigator !== "undefined" && navigator.wakeLock && typeof navigator.wakeLock.request === "function") {
+      if (!activeWakeLock) {
+        activeWakeLock = await navigator.wakeLock.request("screen");
+        activeWakeLock?.addEventListener?.("release", () => {
+          activeWakeLock = null;
+        });
+      }
+    }
+  } catch {
+    // WakeLock may fail on battery saver or unsupported browser; fail safely
+  }
+}
+
+async function releaseWakeLockIfIdle() {
+  if (incoming.size > 0 || activeOutgoingTransfers.size > 0) return;
+  if (activeWakeLock) {
+    try {
+      await activeWakeLock.release();
+    } catch {}
+    activeWakeLock = null;
+  }
+}
+
+function detectPlatformCapabilities() {
+  const ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+  const isIOS = /iPhone|iPad|iPod/i.test(ua);
+  const isAndroid = /Android/i.test(ua);
+  const isSafari = /Safari/i.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|EdgiOS/i.test(ua);
+  const hasOPFS = Boolean(
+    typeof navigator !== "undefined" &&
+      navigator.storage &&
+      typeof navigator.storage.getDirectory === "function"
+  );
+  const hasIndexedDB = typeof indexedDB !== "undefined";
+  return { isIOS, isAndroid, isSafari, isMobile: isIOS || isAndroid, hasOPFS, hasIndexedDB };
+}
+
+async function checkStorageQuota(requiredBytes) {
+  if (!Number.isSafeInteger(requiredBytes) || requiredBytes <= 0) {
+    return { ok: true, availableBytes: null };
+  }
+  try {
+    if (typeof navigator !== "undefined" && navigator.storage && typeof navigator.storage.estimate === "function") {
+      const est = await navigator.storage.estimate();
+      if (est && typeof est.quota === "number" && est.quota > 0) {
+        const usage = typeof est.usage === "number" ? est.usage : 0;
+        const availableBytes = Math.max(0, est.quota - usage);
+        // Require at least 5% or 16 MB safety headroom
+        const safetyMargin = Math.min(64 * 1024 * 1024, Math.max(4 * 1024 * 1024, Math.floor(requiredBytes * 0.05)));
+        if (availableBytes < requiredBytes + safetyMargin) {
+          return {
+            ok: false,
+            availableBytes,
+            quota: est.quota,
+            error: `พื้นที่จัดเก็บข้อมูลของเบราว์เซอร์ไม่เพียงพอ (ต้องการ ${formatSize(requiredBytes)} แต่เหลือพื้นที่ว่าง ${formatSize(availableBytes)})`,
+          };
+        }
+        return { ok: true, availableBytes, quota: est.quota };
+      }
+    }
+  } catch {
+    // Proceed if storage.estimate() is restricted
+  }
+  return { ok: true, availableBytes: null };
+}
+
+// ================= Streaming Cryptographic Integrity Hasher (SHA-256) =================
+/*
+ * Computes a deterministic SHA-256 integrity digest without loading the entire file into RAM:
+ * - Feeds incoming bytes sequentially into fixed INTEGRITY_BLOCK_SIZE (default 1 MB) blocks.
+ * - Uses hardware-accelerated WebCrypto `crypto.subtle.digest("SHA-256", block)` on each block.
+ * - For files <= 1 MB (single block), returns the direct standard SHA-256 hex digest of the file bytes.
+ * - For files > 1 MB (multi-block up to 5 GB+), hashes the concatenated 32-byte block digests + 8-byte total size
+ *   with `crypto.subtle.digest("SHA-256", ...)`.
+ * - Because block boundaries are fixed at 1 MB file offsets, the resulting SHA-256 digest is 100% independent
+ *   of transport chunk sizes (whether 64 KB Relay, 1 MB, 2 MB, or 4 MB adaptive P2P chunks).
+ */
+class IntegrityHasher {
+  constructor(blockSize = SECURITY_LIMITS.INTEGRITY_BLOCK_SIZE) {
+    this.blockSize = Math.max(64 * 1024, blockSize || 1024 * 1024);
+    this.buffer = new Uint8Array(this.blockSize);
+    this.bufLen = 0;
+    this.totalBytes = 0;
+    this.blockDigests = [];
+    this.finalHex = null;
+  }
+
+  async update(chunkLike) {
+    if (this.finalHex) throw new Error("Hasher already finalized");
+    const bytes =
+      chunkLike instanceof Uint8Array
+        ? chunkLike
+        : isArrayBufferLike(chunkLike)
+        ? new Uint8Array(chunkLike)
+        : new Uint8Array(chunkLike.buffer || chunkLike);
+    let offset = 0;
+    this.totalBytes += bytes.byteLength;
+
+    while (offset < bytes.byteLength) {
+      const space = this.blockSize - this.bufLen;
+      const take = Math.min(space, bytes.byteLength - offset);
+      if (this.bufLen === 0 && take === this.blockSize) {
+        const slice = bytes.subarray(offset, offset + this.blockSize);
+        const digest = await crypto.subtle.digest("SHA-256", slice);
+        this.blockDigests.push(new Uint8Array(digest));
+      } else {
+        this.buffer.set(bytes.subarray(offset, offset + take), this.bufLen);
+        this.bufLen += take;
+        if (this.bufLen === this.blockSize) {
+          const digest = await crypto.subtle.digest("SHA-256", this.buffer);
+          this.blockDigests.push(new Uint8Array(digest));
+          this.bufLen = 0;
+        }
+      }
+      offset += take;
+    }
+  }
+
+  async finalize() {
+    if (this.finalHex) return this.finalHex;
+    if (this.totalBytes === 0) {
+      const emptyDigest = await crypto.subtle.digest("SHA-256", new Uint8Array(0));
+      this.finalHex = bytesToHex(new Uint8Array(emptyDigest));
+      this.buffer = null;
+      return this.finalHex;
+    }
+    if (this.bufLen > 0) {
+      const tail = this.buffer.subarray(0, this.bufLen);
+      const digest = await crypto.subtle.digest("SHA-256", tail);
+      this.blockDigests.push(new Uint8Array(digest));
+      this.bufLen = 0;
+    }
+    this.buffer = null;
+
+    if (this.blockDigests.length === 1) {
+      this.finalHex = bytesToHex(this.blockDigests[0]);
+      this.blockDigests = [];
+      return this.finalHex;
+    }
+
+    const summary = new Uint8Array(this.blockDigests.length * 32 + 8);
+    for (let i = 0; i < this.blockDigests.length; i++) {
+      summary.set(this.blockDigests[i], i * 32);
+    }
+    const view = new DataView(summary.buffer);
+    view.setBigUint64(this.blockDigests.length * 32, BigInt(this.totalBytes), false);
+    const rootDigest = await crypto.subtle.digest("SHA-256", summary);
+    this.blockDigests = [];
+    this.finalHex = bytesToHex(new Uint8Array(rootDigest));
+    return this.finalHex;
+  }
+}
+
+function bytesToHex(uint8) {
+  let out = "";
+  for (let i = 0; i < uint8.byteLength; i++) {
+    out += uint8[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+async function computeBlobSha256(blob, blockSize = SECURITY_LIMITS.INTEGRITY_BLOCK_SIZE) {
+  if (!(blob instanceof Blob)) throw new Error("Expected Blob or File");
+  const hasher = new IntegrityHasher(blockSize);
+  const step = hasher.blockSize;
+  let offset = 0;
+  while (offset < blob.size) {
+    const next = Math.min(blob.size, offset + step);
+    const buf = await blob.slice(offset, next).arrayBuffer();
+    await hasher.update(buf);
+    offset = next;
+  }
+  return hasher.finalize();
+}
+
+// ================= 3-Tier Receiver Storage Engine (OPFS -> Segmented Blob Compaction) =================
+/*
+ * Prevents accumulating thousands of raw ArrayBuffers in JS heap RAM during large 1-5 GB transfers:
+ * - Tier 1 (OPFS): Streams chunks directly to disk in the Origin Private File System (`navigator.storage.getDirectory()`)
+ *   and returns a disk-backed `File` (`Blob`) at completion with near-zero RAM footprint.
+ * - Tier 2 (Segmented Blob Compaction): Periodically compacts incoming chunks every `STORAGE_COMPACT_THRESHOLD` (8 MB)
+ *   into immutable `Blob` segments and immediately releases the raw `ArrayBuffer` references so the browser can
+ *   page Blob data and GC raw buffers without ever concatenating large ArrayBuffers.
+ */
+async function createReceiverFileStorage(transferId, fileIndex, meta) {
+  const opfsFileName = `mydrop-rx-${transferId}-${fileIndex}.part`;
+  let opfsRoot = null;
+  let opfsHandle = null;
+  let opfsWritable = null;
+
+  if (
+    typeof navigator !== "undefined" &&
+    navigator.storage &&
+    typeof navigator.storage.getDirectory === "function"
+  ) {
+    try {
+      opfsRoot = await navigator.storage.getDirectory();
+      opfsHandle = await opfsRoot.getFileHandle(opfsFileName, { create: true });
+      if (typeof opfsHandle.createWritable === "function") {
+        opfsWritable = await opfsHandle.createWritable({ keepExistingData: false });
+      }
+    } catch {
+      opfsRoot = null;
+      opfsHandle = null;
+      opfsWritable = null;
+    }
+  }
+
+  if (opfsWritable && opfsHandle) {
+    let closed = false;
+    return {
+      mode: "opfs",
+      compactedSegments: 0,
+      pendingBufferCount: 0,
+      async writeChunk(plainBuf) {
+        if (closed) throw new Error("OPFS writer already closed");
+        await opfsWritable.write(plainBuf);
+      },
+      async finalize(safeMime) {
+        if (closed) throw new Error("OPFS writer already finalized");
+        closed = true;
+        await opfsWritable.close();
+        const diskFile = await opfsHandle.getFile();
+        const finalBlob =
+          diskFile.type === safeMime ? diskFile : diskFile.slice(0, diskFile.size, safeMime);
+        finalBlob._opfsCleanup = async () => {
+          try {
+            await opfsRoot.removeEntry(opfsFileName);
+          } catch {}
+        };
+        return finalBlob;
+      },
+      async abort() {
+        if (closed) return;
+        closed = true;
+        try {
+          if (typeof opfsWritable.abort === "function") await opfsWritable.abort();
+          else await opfsWritable.close();
+        } catch {}
+        try {
+          await opfsRoot?.removeEntry(opfsFileName);
+        } catch {}
+      },
+    };
+  }
+
+  // Fallback Tier: Bounded Segmented Blob Compaction (zero ArrayBuffer concatenation, periodic compaction)
+  let pendingBuffers = [];
+  let pendingBytes = 0;
+  let blobSegments = [];
+  let closed = false;
+
+  const compactPending = () => {
+    if (pendingBuffers.length === 0) return;
+    const seg = new Blob(pendingBuffers);
+    blobSegments.push(seg);
+    pendingBuffers = [];
+    pendingBytes = 0;
+  };
+
+  return {
+    mode: "segmented-blob",
+    get compactedSegments() {
+      return blobSegments.length;
+    },
+    get pendingBufferCount() {
+      return pendingBuffers.length;
+    },
+    async writeChunk(plainBuf) {
+      if (closed) throw new Error("Segmented storage already closed");
+      pendingBuffers.push(plainBuf);
+      pendingBytes += plainBuf.byteLength;
+      if (pendingBytes >= SECURITY_LIMITS.STORAGE_COMPACT_THRESHOLD) {
+        compactPending();
+      }
+    },
+    async finalize(safeMime) {
+      if (closed) throw new Error("Segmented storage already finalized");
+      closed = true;
+      compactPending();
+      const finalBlob = new Blob(blobSegments, { type: safeMime });
+      blobSegments = [];
+      pendingBuffers = [];
+      pendingBytes = 0;
+      return finalBlob;
+    },
+    async abort() {
+      closed = true;
+      pendingBuffers = [];
+      pendingBytes = 0;
+      blobSegments = [];
+    },
+  };
+}
+
+// ================= Adaptive Chunk Size Controller (1 MB - 4 MB) =================
+class AdaptiveChunkSizer {
+  constructor(mode = "p2p") {
+    this.mode = mode;
+    if (mode === "relay") {
+      this.currentSize = Math.min(SECURITY_LIMITS.RELAY_CHUNK_SIZE, SECURITY_LIMITS.MAX_CHUNK_SIZE);
+    } else {
+      const init = Math.min(SECURITY_LIMITS.INITIAL_CHUNK_SIZE, SECURITY_LIMITS.MAX_CHUNK_SIZE);
+      const min = Math.min(SECURITY_LIMITS.MIN_CHUNK_SIZE, SECURITY_LIMITS.MAX_CHUNK_SIZE);
+      this.currentSize = Math.max(min, init);
+    }
+    this.history = [];
+  }
+
+  nextChunkSize() {
+    if (this.mode === "relay") {
+      return Math.min(SECURITY_LIMITS.RELAY_CHUNK_SIZE, SECURITY_LIMITS.MAX_CHUNK_SIZE);
+    }
+    const min = Math.min(SECURITY_LIMITS.MIN_CHUNK_SIZE, SECURITY_LIMITS.MAX_CHUNK_SIZE);
+    return Math.max(min, Math.min(this.currentSize, SECURITY_LIMITS.MAX_CHUNK_SIZE));
+  }
+
+  recordSample(bytesSent, elapsedMs, hadBackpressureStall = false) {
+    if (this.mode === "relay") return this.currentSize;
+    const min = Math.min(SECURITY_LIMITS.MIN_CHUNK_SIZE, SECURITY_LIMITS.MAX_CHUNK_SIZE);
+    const max = SECURITY_LIMITS.MAX_CHUNK_SIZE;
+
+    if (hadBackpressureStall || elapsedMs > 1200) {
+      this.currentSize = Math.max(min, Math.floor(this.currentSize / 2));
+      return this.currentSize;
+    }
+
+    // High throughput (< 250ms per chunk without stall): step up towards 4 MB
+    if (elapsedMs < 250 && this.currentSize < max) {
+      this.currentSize = Math.min(max, this.currentSize * 2);
+    }
+    return this.currentSize;
+  }
+
+  onCongestion() {
+    if (this.mode === "relay") return this.currentSize;
+    const min = Math.min(SECURITY_LIMITS.MIN_CHUNK_SIZE, SECURITY_LIMITS.MAX_CHUNK_SIZE);
+    this.currentSize = Math.max(min, Math.floor(this.currentSize / 2));
+    return this.currentSize;
+  }
+}
+
+function cleanupSctpAssembler(peerId) {
+  const a = sctpFragAssemblers.get(peerId);
+  if (!a) return;
+  clearTimeout(a.timer);
+  a.chunks = [];
+  sctpFragAssemblers.delete(peerId);
+}
+
 function cleanupIncomingTransfer(peerId) {
   const f = incoming.get(peerId);
   if (!f) return;
   clearTimeout(f.timer);
   f.chunks = [];
+  f.outOfOrderChunks?.clear?.();
+  if (f.storage) {
+    f.storage.abort().catch(() => {});
+    f.storage = null;
+  }
   incoming.delete(peerId);
+  cleanupSctpAssembler(peerId);
   setProgress(peerId, null);
+  hideTransferPanelIfIdle(f.transferId);
+  releaseWakeLockIfIdle();
 }
 
 function cleanupAcceptedTransfer(transferId) {
@@ -511,9 +920,21 @@ function cleanupPeerState(peerId) {
     processRequestQueue();
   }
 
+  for (const [tid, out] of activeOutgoingTransfers) {
+    if (out.peerId === peerId) {
+      out.cancelled = true;
+      out.cancelReason = "peer disconnected";
+      out.wakeWaiters?.();
+      activeOutgoingTransfers.delete(tid);
+      hideTransferPanelIfIdle(tid);
+    }
+  }
+
+  cleanupSctpAssembler(peerId);
   peerStatus.delete(peerId);
   peerProgress.delete(peerId);
   peerClientRate.delete(peerId);
+  releaseWakeLockIfIdle();
 }
 
 function cleanupAllPeers(reason = "reset") {
@@ -532,6 +953,7 @@ window.addEventListener("pagehide", () => {
   while (activeObjectUrls.length > 0) {
     const entry = activeObjectUrls.shift();
     try { URL.revokeObjectURL(entry.url); } catch {}
+    try { entry.cleanup?.(); } catch {}
   }
 });
 
@@ -681,12 +1103,46 @@ setInterval(async () => {
 }, 15000);
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") {
-    ensureWS().catch(() => {});
+  if (document.visibilityState === "hidden") {
+    // Extend watchdog timers while backgrounded on mobile (iOS Safari / Android Chrome)
+    for (const [peerId, f] of incoming) {
+      clearTimeout(f.timer);
+      f.timer = setTimeout(() => {
+        abortPeerTransfer(peerId, `การรับไฟล์ ${f.meta.name} หมดเวลาเนื่องจากแอปถูกพักอยู่เบื้องหลัง`);
+      }, SECURITY_LIMITS.PAUSE_TIMEOUT_MS);
+    }
+    if (incoming.size > 0 || activeOutgoingTransfers.size > 0) {
+      const warn = $("#transferWarningBanner");
+      if (warn) {
+        warn.hidden = false;
+        warn.textContent =
+          "⚠️ แอปถูกสลับไปอยู่เบื้องหลัง: กรุณากลับมาที่หน้าจอนี้เพื่อป้องกัน iOS/Android ตัดการเชื่อมต่อไฟล์ขนาดใหญ่";
+      }
+    }
+  } else if (document.visibilityState === "visible") {
+    if (incoming.size > 0 || activeOutgoingTransfers.size > 0) {
+      acquireWakeLock();
+    }
+    for (const [peerId, f] of incoming) {
+      if (!f.paused) resetIncomingWatchdog(peerId, f);
+    }
+    ensureWS()
+      .then(() => {
+        for (const out of activeOutgoingTransfers.values()) {
+          out.wakeWaiters?.();
+        }
+      })
+      .catch(() => {});
   }
 });
 window.addEventListener("online", () => {
-  ensureWS().catch(() => {});
+  ensureWS()
+    .then(() => {
+      for (const out of activeOutgoingTransfers.values()) {
+        out.wakeWaiters?.();
+      }
+    })
+    .catch(() => {});
 });
 
 function signal(to, data) {
@@ -1178,6 +1634,116 @@ function unpackEncryptedChunkBinary(buf) {
   };
 }
 
+// Split an encrypted 0xE2 binary chunk frame (1-4 MB) into SCTP-safe 0xE3 sub-frames when WebRTC maxMessageSize is smaller
+// Layout: [0xE3 (1B) | flags (1B: bit0=lastFrag) | fileIndex (2B) | chunkIndex (4B) | fragIndex (2B) | totalFrags (2B) | totalFrameLen (4B) | payload] = 16B header
+function splitBinaryFrameForSctp(binaryFrame, fileIndex, chunkIndex, maxSctpFrame) {
+  const safeLimit = Math.max(4096, maxSctpFrame || SECURITY_LIMITS.SCTP_SAFE_FRAME_SIZE);
+  if (binaryFrame.byteLength <= safeLimit) {
+    return [binaryFrame];
+  }
+  const src = new Uint8Array(binaryFrame);
+  const payloadCap = Math.max(1024, safeLimit - 16);
+  const totalFrags = Math.ceil(src.byteLength / payloadCap);
+  const frames = [];
+
+  for (let fragIndex = 0; fragIndex < totalFrags; fragIndex++) {
+    const start = fragIndex * payloadCap;
+    const end = Math.min(src.byteLength, start + payloadCap);
+    const slice = src.subarray(start, end);
+    const isLastFrag = fragIndex === totalFrags - 1;
+
+    const pkt = new Uint8Array(16 + slice.byteLength);
+    const view = new DataView(pkt.buffer);
+    pkt[0] = 0xe3;
+    pkt[1] = isLastFrag ? 1 : 0;
+    view.setUint16(2, fileIndex, false);
+    view.setUint32(4, chunkIndex, false);
+    view.setUint16(8, fragIndex, false);
+    view.setUint16(10, totalFrags, false);
+    view.setUint32(12, src.byteLength, false);
+    pkt.set(slice, 16);
+    frames.push(pkt.buffer);
+  }
+  return frames;
+}
+
+function reassembleSctpFragment(peerId, rawBuf) {
+  if (!isArrayBufferLike(rawBuf) || rawBuf.byteLength < 17) {
+    throw new Error("SCTP fragment frame too short");
+  }
+  const bytes = new Uint8Array(rawBuf);
+  if (bytes[0] !== 0xe3) {
+    throw new Error("Invalid SCTP fragment magic");
+  }
+  const view = new DataView(rawBuf);
+  const isLastFrag = (bytes[1] & 1) === 1;
+  const fileIndex = view.getUint16(2, false);
+  const chunkIndex = view.getUint32(4, false);
+  const fragIndex = view.getUint16(8, false);
+  const totalFrags = view.getUint16(10, false);
+  const totalFrameLen = view.getUint32(12, false);
+  const payload = bytes.subarray(16);
+
+  const maxAllowedFrame = SECURITY_LIMITS.MAX_CHUNK_SIZE + 512;
+  if (
+    totalFrags < 2 ||
+    totalFrags > 2048 ||
+    fragIndex >= totalFrags ||
+    totalFrameLen < 72 ||
+    totalFrameLen > maxAllowedFrame
+  ) {
+    cleanupSctpAssembler(peerId);
+    throw new Error("Invalid SCTP fragment bounds");
+  }
+
+  let asm = sctpFragAssemblers.get(peerId);
+  if (fragIndex === 0) {
+    cleanupSctpAssembler(peerId);
+    asm = {
+      fileIndex,
+      chunkIndex,
+      totalFrags,
+      totalFrameLen,
+      nextFrag: 0,
+      offset: 0,
+      buffer: new Uint8Array(totalFrameLen),
+      timer: setTimeout(() => cleanupSctpAssembler(peerId), SECURITY_LIMITS.CHUNK_INACTIVITY_TIMEOUT_MS),
+    };
+    sctpFragAssemblers.set(peerId, asm);
+  } else if (
+    !asm ||
+    asm.fileIndex !== fileIndex ||
+    asm.chunkIndex !== chunkIndex ||
+    asm.totalFrags !== totalFrags ||
+    asm.totalFrameLen !== totalFrameLen ||
+    asm.nextFrag !== fragIndex
+  ) {
+    cleanupSctpAssembler(peerId);
+    throw new Error("Out-of-sequence SCTP fragment");
+  }
+
+  if (asm.offset + payload.byteLength > asm.totalFrameLen) {
+    cleanupSctpAssembler(peerId);
+    throw new Error("SCTP fragment overflow");
+  }
+
+  asm.buffer.set(payload, asm.offset);
+  asm.offset += payload.byteLength;
+  asm.nextFrag += 1;
+
+  if (isLastFrag) {
+    if (asm.nextFrag !== asm.totalFrags || asm.offset !== asm.totalFrameLen) {
+      cleanupSctpAssembler(peerId);
+      throw new Error("Incomplete SCTP fragmented frame");
+    }
+    const completeBuf = asm.buffer.buffer;
+    clearTimeout(asm.timer);
+    sctpFragAssemblers.delete(peerId);
+    return completeBuf;
+  }
+  return null;
+}
+
 async function decryptFileChunk(peerId, packet) {
   const sess = e2eeSessions.get(peerId);
   if (!sess || sess.state !== "established" || !sess.rxKey) {
@@ -1335,16 +1901,60 @@ async function connect(peerId) {
     closeConn(peerId);
     throw err;
   }
-  // Reserve 128 bytes for AES-GCM tag and binary framing header
-  const sctpMax = c.pc.sctp?.maxMessageSize || 16384;
-  c.chunk = Math.min(SECURITY_LIMITS.MAX_CHUNK_SIZE, Math.max(4096, sctpMax - 128));
+  // Negotiate safe SCTP frame size (for 0xE3 sub-frame splitting) while supporting 1-4 MB logical chunks
+  const rawSctpMax = c.pc.sctp?.maxMessageSize;
+  const sctpMax =
+    typeof rawSctpMax === "number" && rawSctpMax > 0
+      ? Math.min(256 * 1024, rawSctpMax)
+      : SECURITY_LIMITS.SCTP_SAFE_FRAME_SIZE;
+  c.maxSctpFrame = Math.max(16384, sctpMax - 128);
+  c.chunk = Math.min(
+    SECURITY_LIMITS.MAX_CHUNK_SIZE,
+    Math.max(SECURITY_LIMITS.MIN_CHUNK_SIZE, SECURITY_LIMITS.INITIAL_CHUNK_SIZE)
+  );
   return c;
 }
 
+async function waitForDataChannelDrain(dc, maxBuffer = MAX_BUFFER) {
+  if (!dc || dc.readyState !== "open" || !(dc.bufferedAmount > maxBuffer)) {
+    return 0;
+  }
+  const t0 = Date.now();
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    let pollTimer = null;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(pollTimer);
+      try {
+        dc.removeEventListener?.("bufferedamountlow", onLow);
+        dc.removeEventListener?.("close", onClose);
+      } catch {}
+      if (err) reject(err);
+      else resolve();
+    };
+    const onLow = () => finish();
+    const onClose = () => finish(new Error("DataChannel closed during backpressure wait"));
+    dc.addEventListener?.("bufferedamountlow", onLow, { once: true });
+    dc.addEventListener?.("close", onClose, { once: true });
+    pollTimer = setInterval(() => {
+      if (dc.readyState !== "open") {
+        finish(new Error("DataChannel closed"));
+      } else if (!(dc.bufferedAmount > (dc.bufferedAmountLowThreshold || maxBuffer / 2))) {
+        finish();
+      }
+    }, 40);
+  });
+  return Date.now() - t0;
+}
+
 function createRelayTransport(peerId) {
+  const relayChunk = Math.min(SECURITY_LIMITS.RELAY_CHUNK_SIZE, SECURITY_LIMITS.MAX_CHUNK_SIZE);
   return {
     mode: "relay",
-    chunk: SECURITY_LIMITS.MAX_CHUNK_SIZE,
+    chunk: relayChunk,
+    maxSctpFrame: relayChunk,
     isOpen: () => ws?.readyState === 1,
     async sendEncryptedControl(obj) {
       const encPkt = await encryptControlMessage(peerId, obj);
@@ -1352,6 +1962,12 @@ function createRelayTransport(peerId) {
     },
     async sendEncryptedChunk(transferId, fileIndex, chunkIndex, isLast, plainBuf) {
       const enc = await encryptFileChunk(peerId, transferId, fileIndex, chunkIndex, isLast, plainBuf);
+      let stalledMs = 0;
+      while (ws?.readyState === 1 && ws.bufferedAmount > 1024 * 1024) {
+        const t0 = Date.now();
+        await new Promise((r) => setTimeout(r, 25));
+        stalledMs += Date.now() - t0;
+      }
       relaySend(peerId, {
         type: "enc-chunk",
         transferId: enc.transferId,
@@ -1361,9 +1977,7 @@ function createRelayTransport(peerId) {
         iv: bufToBase64(enc.iv),
         ct: bufToBase64(enc.ctBuf),
       });
-      if (ws.bufferedAmount > 1024 * 1024) {
-        await new Promise((r) => setTimeout(r, 25));
-      }
+      return { stalledMs };
     },
   };
 }
@@ -1378,6 +1992,7 @@ async function getTransport(peerId) {
     return {
       mode: "p2p",
       chunk: c.chunk,
+      maxSctpFrame: c.maxSctpFrame || SECURITY_LIMITS.SCTP_SAFE_FRAME_SIZE,
       isOpen: () => c.dc?.readyState === "open",
       async sendEncryptedControl(obj) {
         const encPkt = await encryptControlMessage(peerId, obj);
@@ -1386,10 +2001,19 @@ async function getTransport(peerId) {
       async sendEncryptedChunk(transferId, fileIndex, chunkIndex, isLast, plainBuf) {
         const enc = await encryptFileChunk(peerId, transferId, fileIndex, chunkIndex, isLast, plainBuf);
         const binaryFrame = packEncryptedChunkBinary(enc);
-        if (c.dc.bufferedAmount > MAX_BUFFER) {
-          await new Promise((r) => c.dc.addEventListener("bufferedamountlow", r, { once: true }));
+        const subFrames = splitBinaryFrameForSctp(
+          binaryFrame,
+          fileIndex,
+          chunkIndex,
+          c.maxSctpFrame || SECURITY_LIMITS.SCTP_SAFE_FRAME_SIZE
+        );
+        let stalledMs = 0;
+        for (const frame of subFrames) {
+          if (c.dc?.readyState !== "open") throw new Error("DataChannel closed");
+          stalledMs += await waitForDataChannelDrain(c.dc, MAX_BUFFER);
+          c.dc.send(frame);
         }
-        c.dc.send(binaryFrame);
+        return { stalledMs, subFrames: subFrames.length };
       },
     };
   } catch {
@@ -1457,7 +2081,324 @@ async function onSignal(from, data) {
   }
 }
 
-// ================= ส่งไฟล์ / ข้อความ (E2EE) =================
+// ================= Active Transfer UI Panel & Controls =================
+let currentUiTransfer = null; // { transferId, peerId, direction, mode, totalBytes, files: [{ name, size, bytes, status }], startTime, lastSampleTime, lastSampleBytes, speedBps, paused }
+
+function formatSpeed(bps) {
+  if (!Number.isFinite(bps) || bps <= 0) return "--";
+  if (bps < 1024) return `${Math.round(bps)} B/s`;
+  if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
+  return `${(bps / (1024 * 1024)).toFixed(2)} MB/s`;
+}
+
+function formatDuration(sec) {
+  if (!Number.isFinite(sec) || sec < 0 || sec > 86400 * 7) return "--";
+  const s = Math.ceil(sec);
+  if (s < 60) return `${s} วินาที`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return `${m} นาที ${remS} วินาที`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `${h} ชม. ${remM} นาที`;
+}
+
+function initTransferPanel(transferId, peerId, direction, mode, files, totalBytes) {
+  const now = Date.now();
+  currentUiTransfer = {
+    transferId,
+    peerId,
+    direction, // "send" | "receive"
+    mode: mode || "p2p",
+    totalBytes,
+    transferredBytes: 0,
+    files: files.map((f) => ({
+      name: f.name,
+      size: f.size,
+      bytes: 0,
+      status: direction === "send" ? "รอส่ง" : "รอรับ",
+    })),
+    startTime: now,
+    lastSampleTime: now,
+    lastSampleBytes: 0,
+    speedBps: 0,
+    paused: false,
+  };
+
+  const panel = $("#transferPanel");
+  if (!panel) return;
+  panel.hidden = false;
+
+  const titleEl = $("#transferTitle");
+  if (titleEl) {
+    titleEl.textContent =
+      direction === "send"
+        ? `กำลังส่งไฟล์ไปยัง ${peerName(peerId)}`
+        : `กำลังรับไฟล์จาก ${peerName(peerId)}`;
+  }
+
+  const badgeEl = $("#transferModeBadge");
+  if (badgeEl) {
+    badgeEl.textContent =
+      mode === "relay" ? "Relay Fallback • E2EE (สูงสุด 500 MB)" : "WebRTC P2P Direct • E2EE (สูงสุด 5 GB)";
+  }
+
+  const pauseBtn = $("#pauseTransferBtn");
+  const resumeBtn = $("#resumeTransferBtn");
+  if (pauseBtn) pauseBtn.hidden = false;
+  if (resumeBtn) resumeBtn.hidden = true;
+
+  const cap = detectPlatformCapabilities();
+  const warnEl = $("#transferWarningBanner");
+  if (warnEl) {
+    if (totalBytes >= 50 * 1024 * 1024 || cap.isMobile) {
+      warnEl.hidden = false;
+      warnEl.textContent = cap.isIOS
+        ? "⚠️ iPhone / iOS Safari: กรุณาเปิดหน้าจอค้างไว้และอย่าสลับแอปขณะโอนย้ายวิดีโอขนาดใหญ่ ระบบกำลังสตรีมข้อมูลแบบประหยัดหน่วยความจำ"
+        : "⚠️ คำแนะนำสำหรับไฟล์ขนาดใหญ่: กรุณาเปิดหน้าจอค้างไว้และอย่าสลับแอปหรือล็อกหน้าจอขณะรับ-ส่งไฟล์ เพื่อป้องกันเบราว์เซอร์ตัดการเชื่อมต่อ";
+    } else {
+      warnEl.hidden = true;
+    }
+  }
+
+  renderTransferPanelFiles();
+  updateTransferPanelStats(0);
+}
+
+function renderTransferPanelFiles() {
+  const list = $("#transferFileList");
+  if (!list || !currentUiTransfer) return;
+  list.textContent = "";
+  currentUiTransfer.files.forEach((f, idx) => {
+    const li = document.createElement("li");
+    li.className = "transfer-file-item";
+    li.dataset.fileIndex = String(idx);
+    const pct = f.size > 0 ? Math.min(100, Math.round((f.bytes / f.size) * 100)) : 100;
+    li.innerHTML = `
+      <div class="transfer-file-top">
+        <span class="transfer-file-name"></span>
+        <span class="transfer-file-status"></span>
+      </div>
+      <div class="transfer-file-bar-track">
+        <div class="transfer-file-bar" style="width:${pct}%"></div>
+      </div>`;
+    li.querySelector(".transfer-file-name").textContent = `${f.name} (${formatSize(f.size)})`;
+    li.querySelector(".transfer-file-status").textContent = `${f.status} • ${pct}%`;
+    list.appendChild(li);
+  });
+}
+
+function updateTransferPanelFile(transferId, fileIndex, fileBytes, statusText) {
+  if (!currentUiTransfer || currentUiTransfer.transferId !== transferId) return;
+  const f = currentUiTransfer.files[fileIndex];
+  if (!f) return;
+  if (typeof fileBytes === "number") f.bytes = Math.min(f.size, Math.max(0, fileBytes));
+  if (statusText) f.status = statusText;
+
+  let sum = 0;
+  for (const item of currentUiTransfer.files) sum += item.bytes;
+  updateTransferPanelStats(sum);
+  renderTransferPanelFiles();
+}
+
+function updateTransferPanelStats(overallBytes) {
+  if (!currentUiTransfer) return;
+  const now = Date.now();
+  currentUiTransfer.transferredBytes = Math.min(currentUiTransfer.totalBytes, Math.max(0, overallBytes));
+
+  const dtSec = (now - currentUiTransfer.lastSampleTime) / 1000;
+  if (dtSec >= 0.25) {
+    const dBytes = Math.max(0, currentUiTransfer.transferredBytes - currentUiTransfer.lastSampleBytes);
+    const instSpeed = dBytes / dtSec;
+    currentUiTransfer.speedBps =
+      currentUiTransfer.speedBps > 0 ? currentUiTransfer.speedBps * 0.65 + instSpeed * 0.35 : instSpeed;
+    currentUiTransfer.lastSampleTime = now;
+    currentUiTransfer.lastSampleBytes = currentUiTransfer.transferredBytes;
+  } else if (currentUiTransfer.speedBps === 0 && now > currentUiTransfer.startTime) {
+    const totalElapsed = (now - currentUiTransfer.startTime) / 1000;
+    if (totalElapsed > 0.05) {
+      currentUiTransfer.speedBps = currentUiTransfer.transferredBytes / totalElapsed;
+    }
+  }
+
+  const pct =
+    currentUiTransfer.totalBytes > 0
+      ? Math.min(100, Math.round((currentUiTransfer.transferredBytes / currentUiTransfer.totalBytes) * 100))
+      : 100;
+  const remBytes = Math.max(0, currentUiTransfer.totalBytes - currentUiTransfer.transferredBytes);
+  const etaSec = currentUiTransfer.speedBps > 0 ? remBytes / currentUiTransfer.speedBps : NaN;
+
+  const bytesEl = $("#transferOverallBytes");
+  const pctEl = $("#transferOverallPct");
+  const barEl = $("#transferOverallBar");
+  const speedEl = $("#transferSpeed");
+  const etaEl = $("#transferEta");
+
+  if (bytesEl) {
+    bytesEl.textContent = `${formatSize(currentUiTransfer.transferredBytes)} / ${formatSize(currentUiTransfer.totalBytes)}`;
+  }
+  if (pctEl) pctEl.textContent = `${pct}%`;
+  if (barEl) barEl.style.width = `${pct}%`;
+  if (speedEl) {
+    speedEl.textContent = currentUiTransfer.paused
+      ? "ความเร็ว: พักการส่งชั่วคราว"
+      : `ความเร็ว: ${formatSpeed(currentUiTransfer.speedBps)}`;
+  }
+  if (etaEl) {
+    etaEl.textContent = currentUiTransfer.paused
+      ? "เวลาที่เหลือ: --"
+      : `เวลาที่เหลือ: ${remBytes === 0 ? "0 วินาที" : formatDuration(etaSec)}`;
+  }
+}
+
+function hideTransferPanelIfIdle(transferId = null) {
+  if (transferId && currentUiTransfer && currentUiTransfer.transferId !== transferId) return;
+  if (activeOutgoingTransfers.size === 0 && incoming.size === 0) {
+    currentUiTransfer = null;
+    const panel = $("#transferPanel");
+    if (panel) panel.hidden = true;
+  }
+}
+
+async function sendControlBestEffort(peerId, payload) {
+  try {
+    const encPkt = await encryptControlMessage(peerId, payload);
+    const c = conns.get(peerId);
+    if (c?.dc?.readyState === "open") {
+      try {
+        c.dc.send(JSON.stringify(encPkt));
+        return true;
+      } catch {}
+    }
+    if (ws?.readyState === 1) {
+      relaySend(peerId, encPkt);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function pauseActiveTransfer(transferId = currentUiTransfer?.transferId) {
+  if (!transferId) return false;
+  const out = activeOutgoingTransfers.get(transferId);
+  if (out && !out.paused) {
+    out.paused = true;
+    if (currentUiTransfer?.transferId === transferId) {
+      currentUiTransfer.paused = true;
+      if ($("#pauseTransferBtn")) $("#pauseTransferBtn").hidden = true;
+      if ($("#resumeTransferBtn")) $("#resumeTransferBtn").hidden = false;
+      updateTransferPanelStats(currentUiTransfer.transferredBytes);
+    }
+    sendControlBestEffort(out.peerId, { type: "transfer-pause", transferId, reason: "user" });
+    setStatus(out.peerId, "พักการส่งชั่วคราว");
+    return true;
+  }
+  for (const [peerId, f] of incoming) {
+    if (f.transferId === transferId && !f.paused) {
+      f.paused = true;
+      clearTimeout(f.timer);
+      f.timer = setTimeout(() => {
+        abortPeerTransfer(peerId, `การรับไฟล์ ${f.meta.name} หมดเวลาขณะพักการส่ง`);
+      }, SECURITY_LIMITS.PAUSE_TIMEOUT_MS);
+      if (currentUiTransfer?.transferId === transferId) {
+        currentUiTransfer.paused = true;
+        if ($("#pauseTransferBtn")) $("#pauseTransferBtn").hidden = true;
+        if ($("#resumeTransferBtn")) $("#resumeTransferBtn").hidden = false;
+        updateTransferPanelStats(currentUiTransfer.transferredBytes);
+      }
+      sendControlBestEffort(peerId, { type: "transfer-pause", transferId, reason: "user" });
+      setStatus(peerId, "พักการรับชั่วคราว");
+      return true;
+    }
+  }
+  return false;
+}
+
+function resumeActiveTransfer(transferId = currentUiTransfer?.transferId) {
+  if (!transferId) return false;
+  const out = activeOutgoingTransfers.get(transferId);
+  if (out && out.paused) {
+    out.paused = false;
+    if (currentUiTransfer?.transferId === transferId) {
+      currentUiTransfer.paused = false;
+      if ($("#pauseTransferBtn")) $("#pauseTransferBtn").hidden = false;
+      if ($("#resumeTransferBtn")) $("#resumeTransferBtn").hidden = true;
+    }
+    sendControlBestEffort(out.peerId, { type: "transfer-resume", transferId });
+    out.wakeWaiters?.();
+    return true;
+  }
+  for (const [peerId, f] of incoming) {
+    if (f.transferId === transferId && f.paused) {
+      f.paused = false;
+      resetIncomingWatchdog(peerId, f);
+      if (currentUiTransfer?.transferId === transferId) {
+        currentUiTransfer.paused = false;
+        if ($("#pauseTransferBtn")) $("#pauseTransferBtn").hidden = false;
+        if ($("#resumeTransferBtn")) $("#resumeTransferBtn").hidden = true;
+      }
+      sendControlBestEffort(peerId, {
+        type: "transfer-resume",
+        transferId,
+        fileIndex: f.fileIndex,
+        nextChunkIndex: f.expectedChunkIndex,
+        receivedBytes: f.received,
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+function cancelActiveTransfer(transferId = currentUiTransfer?.transferId, notifyPeer = true) {
+  if (!transferId) return false;
+  const out = activeOutgoingTransfers.get(transferId);
+  if (out) {
+    out.cancelled = true;
+    out.cancelReason = "cancelled by user";
+    if (notifyPeer) {
+      sendControlBestEffort(out.peerId, { type: "transfer-cancel", transferId, reason: "user" });
+    }
+    out.wakeWaiters?.();
+    activeOutgoingTransfers.delete(transferId);
+    setProgress(out.peerId, null);
+    hideTransferPanelIfIdle(transferId);
+    releaseWakeLockIfIdle();
+    toast("ยกเลิกการส่งไฟล์แล้ว");
+    return true;
+  }
+  for (const [peerId, f] of incoming) {
+    if (f.transferId === transferId) {
+      if (notifyPeer) {
+        sendControlBestEffort(peerId, { type: "transfer-cancel", transferId, reason: "user" });
+      }
+      abortPeerTransfer(peerId, "ยกเลิกการรับไฟล์แล้ว");
+      return true;
+    }
+  }
+  const accepted = acceptedTransfers.get(transferId);
+  if (accepted) {
+    if (notifyPeer) {
+      sendControlBestEffort(accepted.peerId, { type: "transfer-cancel", transferId, reason: "user" });
+    }
+    cleanupAcceptedTransfer(transferId);
+    hideTransferPanelIfIdle(transferId);
+    return true;
+  }
+  return false;
+}
+
+if ($("#pauseTransferBtn")) {
+  $("#pauseTransferBtn").onclick = () => pauseActiveTransfer();
+}
+if ($("#resumeTransferBtn")) {
+  $("#resumeTransferBtn").onclick = () => resumeActiveTransfer();
+}
+if ($("#cancelTransferBtn")) {
+  $("#cancelTransferBtn").onclick = () => cancelActiveTransfer();
+}
+
+// ================= ส่งไฟล์ / ข้อความ (E2EE + Streaming + Backpressure + Resume + SHA-256) =================
 async function sendFiles(peerId, files) {
   if (!files || !files.length) return false;
   if (!isKnownPeer(peerId)) {
@@ -1465,9 +2406,9 @@ async function sendFiles(peerId, files) {
     return false;
   }
 
-  const validation = validateOutgoingFiles(files);
-  if (!validation.ok) {
-    toast(validation.error);
+  const initialValidation = validateOutgoingFiles(files, "p2p");
+  if (!initialValidation.ok) {
+    toast(initialValidation.error);
     return false;
   }
 
@@ -1478,6 +2419,14 @@ async function sendFiles(peerId, files) {
   } catch {
     setStatus(peerId, "");
     toast("สร้างการเชื่อมต่อที่ปลอดภัยไม่สำเร็จ");
+    return false;
+  }
+
+  // Re-validate against actual established transport mode (Relay fallback has a strict 500 MB limit due to Cloudflare DO constraints)
+  const modeValidation = validateOutgoingFiles(files, tx.mode);
+  if (!modeValidation.ok) {
+    setStatus(peerId, "");
+    toast(modeValidation.error);
     return false;
   }
 
@@ -1504,6 +2453,7 @@ async function sendFiles(peerId, files) {
   const reqMsg = {
     type: "file-request",
     transferId,
+    transportMode: tx.mode,
     files: sanitizedManifest,
   };
 
@@ -1513,6 +2463,16 @@ async function sendFiles(peerId, files) {
     try {
       await ensureWS();
       tx = createRelayTransport(peerId);
+      const relayVal = validateOutgoingFiles(files, "relay");
+      if (!relayVal.ok) {
+        const p = pendingResponses.get(transferId);
+        if (p) clearTimeout(p.timer);
+        pendingResponses.delete(transferId);
+        setStatus(peerId, "");
+        toast(relayVal.error);
+        return false;
+      }
+      reqMsg.transportMode = "relay";
       await tx.sendEncryptedControl(reqMsg);
     } catch {
       const p = pendingResponses.get(transferId);
@@ -1527,80 +2487,343 @@ async function sendFiles(peerId, files) {
   const sas = e2eeSessions.get(peerId)?.sas;
   setStatus(peerId, sas ? `รอผู้รับตอบรับ (รหัส: ${sas})` : "รอผู้รับตอบรับ...");
 
-  let accepted;
+  let resp;
   try {
-    accepted = await responsePromise;
+    resp = await responsePromise;
   } catch {
     setStatus(peerId, "");
     toast("ไม่ได้รับการตอบรับจากผู้รับ");
     return false;
   }
 
+  const accepted = typeof resp === "object" && resp !== null ? Boolean(resp.accepted) : Boolean(resp);
+  const rejectReason = typeof resp === "object" && resp !== null ? resp.reason : "";
   if (!accepted) {
     setStatus(peerId, "");
-    toast("ผู้รับปฏิเสธไฟล์");
+    if (rejectReason === "insufficient-storage") {
+      toast("ผู้รับมีพื้นที่จัดเก็บข้อมูลไม่เพียงพอสำหรับไฟล์ขนาดใหญ่นี้");
+    } else {
+      toast("ผู้รับปฏิเสธไฟล์");
+    }
     return false;
   }
 
-  for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
-    const file = files[fileIndex];
-    const meta = sanitizedManifest[fileIndex];
+  await acquireWakeLock();
+  initTransferPanel(transferId, peerId, "send", tx.mode, sanitizedManifest, modeValidation.totalBytes);
 
-    if (!tx.isOpen()) {
+  const waiters = new Set();
+  const outState = {
+    transferId,
+    peerId,
+    mode: tx.mode,
+    files,
+    manifest: sanitizedManifest,
+    currentFileIndex: 0,
+    ackedChunkIndex: -1,
+    ackedBytes: 0,
+    retransmitQueue: [],
+    resumeTarget: null,
+    fileVerifyResult: null,
+    paused: false,
+    cancelled: false,
+    cancelReason: "",
+    wakeWaiters() {
+      for (const fn of [...waiters]) fn();
+    },
+    waitForEvent(timeoutMs = 5000) {
+      return new Promise((resolve) => {
+        let timer;
+        const done = () => {
+          clearTimeout(timer);
+          waiters.delete(done);
+          resolve();
+        };
+        waiters.add(done);
+        timer = setTimeout(done, timeoutMs);
+      });
+    },
+  };
+  activeOutgoingTransfers.set(transferId, outState);
+
+  const attemptReconnectAndResume = async (fileIndex) => {
+    if (outState.cancelled) return false;
+    setStatus(peerId, "การเชื่อมต่อสะดุด กำลังเชื่อมต่อใหม่เพื่อส่งต่อ...");
+    const deadline = Date.now() + SECURITY_LIMITS.RESUME_TIMEOUT_MS;
+
+    while (Date.now() < deadline && !outState.cancelled) {
       try {
         await ensureWS();
-        tx = createRelayTransport(peerId);
-      } catch {
-        setProgress(peerId, null);
-        toast("การเชื่อมต่อหลุดระหว่างส่ง");
-        return false;
-      }
+        tx = await getTransport(peerId);
+        if (tx.mode === "relay") {
+          const relayCheck = validateOutgoingFiles([files[fileIndex]], "relay");
+          if (!relayCheck.ok) {
+            toast(relayCheck.error);
+            return false;
+          }
+        }
+        outState.resumeTarget = null;
+        await tx.sendEncryptedControl({
+          type: "resume-request",
+          transferId,
+          fileIndex,
+        });
+        const waitEnd = Date.now() + 4000;
+        while (Date.now() < waitEnd && !outState.resumeTarget && !outState.cancelled) {
+          await outState.waitForEvent(500);
+        }
+        if (outState.resumeTarget && outState.resumeTarget.fileIndex === fileIndex) {
+          if (!outState.resumeTarget.canResume) return false;
+          return true;
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 400));
     }
+    return false;
+  };
 
-    const totalChunks = meta.size === 0 ? 0 : Math.ceil(meta.size / tx.chunk);
-    try {
-      await tx.sendEncryptedControl({
-        type: "header",
-        transferId,
-        fileIndex,
-        name: meta.name,
-        size: meta.size,
-        mime: meta.mime,
-        totalChunks,
-      });
-    } catch {
-      setProgress(peerId, null);
-      toast("ส่งข้อมูลหัวไฟล์ไม่สำเร็จ");
-      return false;
-    }
+  try {
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+      if (outState.cancelled) throw new Error(outState.cancelReason || "cancelled");
+      const file = files[fileIndex];
+      const meta = sanitizedManifest[fileIndex];
 
-    let offset = 0;
-    let chunkIndex = 0;
-    while (offset < file.size) {
+      outState.currentFileIndex = fileIndex;
+      outState.ackedChunkIndex = -1;
+      outState.ackedBytes = 0;
+      outState.retransmitQueue = [];
+      outState.resumeTarget = null;
+      outState.fileVerifyResult = null;
+
       if (!tx.isOpen()) {
-        setProgress(peerId, null);
-        toast("การเชื่อมต่อหลุดระหว่างส่ง");
-        return false;
+        const ok = await attemptReconnectAndResume(fileIndex);
+        if (!ok && !tx.isOpen()) throw new Error("connection lost");
       }
-      const nextOffset = Math.min(file.size, offset + tx.chunk);
-      const isLast = nextOffset >= file.size;
-      const buf = await file.slice(offset, nextOffset).arrayBuffer();
+
+      const sizer = new AdaptiveChunkSizer(tx.mode);
+      const initialChunkSize = sizer.nextChunkSize();
+      const estimatedChunks = meta.size === 0 ? 0 : Math.ceil(meta.size / initialChunkSize);
+
       try {
-        await tx.sendEncryptedChunk(transferId, fileIndex, chunkIndex, isLast, buf);
+        await tx.sendEncryptedControl({
+          type: "header",
+          transferId,
+          fileIndex,
+          name: meta.name,
+          size: meta.size,
+          mime: meta.mime,
+          totalChunks: estimatedChunks,
+          chunkSize: initialChunkSize,
+          resumable: true,
+          requiresCommit: true,
+          transportMode: tx.mode,
+        });
       } catch {
         setProgress(peerId, null);
-        toast("การเข้ารหัสหรือส่งไฟล์ล้มเหลว");
+        toast("ส่งข้อมูลหัวไฟล์ไม่สำเร็จ");
         return false;
       }
-      offset += buf.byteLength;
-      chunkIndex += 1;
-      setProgress(peerId, offset / file.size, `เข้ารหัสและส่ง ${meta.name}`);
-    }
-  }
 
-  setProgress(peerId, null);
-  toast(tx.mode === "relay" ? "ส่งเสร็จแล้ว (เข้ารหัส E2EE ผ่าน Relay)" : "ส่งเสร็จแล้ว (เข้ารหัส E2EE P2P)");
-  return true;
+      updateTransferPanelFile(transferId, fileIndex, 0, "กำลังส่ง");
+      const fileHasher = new IntegrityHasher();
+      const chunkMap = new Map(); // chunkIndex -> { offset, size, isLast }
+      let offset = 0;
+      let hashedOffset = 0;
+      let chunkIndex = 0;
+
+      const sendSingleChunkByInfo = async (cIdx, cInfo) => {
+        const buf = await file.slice(cInfo.offset, cInfo.offset + cInfo.size).arrayBuffer();
+        if (buf.byteLength !== cInfo.size) {
+          throw new Error("File read size mismatch (file modified or truncated during transfer)");
+        }
+        // Feed only newly visited sequential bytes into the file integrity hasher
+        if (cInfo.offset + buf.byteLength > hashedOffset) {
+          const sliceStart = Math.max(0, hashedOffset - cInfo.offset);
+          const unhashedSlice = sliceStart === 0 ? buf : buf.slice(sliceStart);
+          await fileHasher.update(unhashedSlice);
+          hashedOffset = cInfo.offset + buf.byteLength;
+        }
+        const t0 = Date.now();
+        const sendRes = await tx.sendEncryptedChunk(transferId, fileIndex, cIdx, cInfo.isLast, buf);
+        const elapsedMs = Date.now() - t0;
+        sizer.recordSample(buf.byteLength, elapsedMs, (sendRes?.stalledMs || 0) > 80);
+      };
+
+      while (offset < file.size || outState.retransmitQueue.length > 0) {
+        if (outState.cancelled) throw new Error(outState.cancelReason || "cancelled");
+
+        // 1. Wait while paused
+        while (outState.paused && !outState.cancelled) {
+          await outState.waitForEvent(500);
+        }
+        if (outState.cancelled) throw new Error(outState.cancelReason || "cancelled");
+
+        // 2. Apply resume rewind if receiver requested a specific offset/chunkIndex
+        if (outState.resumeTarget && outState.resumeTarget.fileIndex === fileIndex) {
+          const target = outState.resumeTarget;
+          outState.resumeTarget = null;
+          if (
+            Number.isSafeInteger(target.receivedBytes) &&
+            target.receivedBytes >= 0 &&
+            target.receivedBytes <= hashedOffset &&
+            Number.isSafeInteger(target.nextChunkIndex) &&
+            target.nextChunkIndex >= 0
+          ) {
+            offset = target.receivedBytes;
+            chunkIndex = target.nextChunkIndex;
+            outState.ackedBytes = Math.max(outState.ackedBytes, target.receivedBytes);
+            outState.retransmitQueue = [];
+          }
+        }
+
+        // 3. Process missing chunk retransmission requests (chunk-nak)
+        if (outState.retransmitQueue.length > 0) {
+          const missingIdx = outState.retransmitQueue.shift();
+          const cInfo = chunkMap.get(missingIdx);
+          if (cInfo) {
+            try {
+              sizer.onCongestion();
+              await sendSingleChunkByInfo(missingIdx, cInfo);
+            } catch {
+              const resumed = await attemptReconnectAndResume(fileIndex);
+              if (!resumed) throw new Error("connection lost during retransmission");
+            }
+            continue;
+          }
+        }
+
+        if (offset >= file.size) break;
+
+        // 4. Receiver-driven sliding window backpressure (limit unacknowledged bytes in flight)
+        const maxInFlight = SECURITY_LIMITS.MAX_IN_FLIGHT_BYTES;
+        const backpressureWaitStart = Date.now();
+        while (
+          offset - outState.ackedBytes >= maxInFlight &&
+          outState.retransmitQueue.length === 0 &&
+          !outState.resumeTarget &&
+          !outState.cancelled
+        ) {
+          if (!tx.isOpen() || Date.now() - backpressureWaitStart > SECURITY_LIMITS.CHUNK_INACTIVITY_TIMEOUT_MS) {
+            const resumed = await attemptReconnectAndResume(fileIndex);
+            if (!resumed) throw new Error("receiver ack timeout");
+            break;
+          }
+          await outState.waitForEvent(200);
+        }
+        if (outState.cancelled) throw new Error(outState.cancelReason || "cancelled");
+        if (outState.retransmitQueue.length > 0 || outState.resumeTarget) continue;
+
+        if (!tx.isOpen()) {
+          const resumed = await attemptReconnectAndResume(fileIndex);
+          if (!resumed) throw new Error("connection lost");
+          continue;
+        }
+
+        // 5. Read and send next progressive chunk using adaptive chunk size (1-4 MB on P2P, 64 KB on Relay)
+        const existingInfo = chunkMap.get(chunkIndex);
+        let cInfo;
+        if (existingInfo && existingInfo.offset === offset) {
+          cInfo = existingInfo;
+        } else {
+          const stepSize = sizer.nextChunkSize();
+          const nextOffset = Math.min(file.size, offset + stepSize);
+          cInfo = {
+            offset,
+            size: nextOffset - offset,
+            isLast: nextOffset >= file.size,
+          };
+          chunkMap.set(chunkIndex, cInfo);
+        }
+
+        try {
+          await sendSingleChunkByInfo(chunkIndex, cInfo);
+        } catch {
+          const resumed = await attemptReconnectAndResume(fileIndex);
+          if (!resumed) throw new Error("chunk send failed");
+          continue;
+        }
+
+        offset += cInfo.size;
+        chunkIndex += 1;
+
+        // Prune old acknowledged entries from chunkMap to keep sender memory O(window_size)
+        if (chunkMap.size > 64 && outState.ackedChunkIndex > 0) {
+          for (const k of chunkMap.keys()) {
+            if (k < outState.ackedChunkIndex - 8) chunkMap.delete(k);
+          }
+        }
+
+        const ratio = file.size > 0 ? offset / file.size : 1;
+        setProgress(peerId, ratio, `เข้ารหัสและส่ง ${meta.name}`);
+        updateTransferPanelFile(transferId, fileIndex, offset, "กำลังส่ง");
+      }
+
+      // 6. Finalize file SHA-256 cryptographic digest and wait for receiver integrity verification
+      updateTransferPanelFile(transferId, fileIndex, file.size, "กำลังตรวจสอบ SHA-256...");
+      setStatus(peerId, `กำลังตรวจสอบความถูกต้อง (SHA-256) ของ ${meta.name}...`);
+      const sha256 = await fileHasher.finalize();
+
+      const sendCommit = async () => {
+        await tx.sendEncryptedControl({
+          type: "file-complete",
+          transferId,
+          fileIndex,
+          size: meta.size,
+          totalChunks: chunkIndex,
+          sha256,
+        });
+      };
+
+      try {
+        await sendCommit();
+      } catch {
+        const resumed = await attemptReconnectAndResume(fileIndex);
+        if (!resumed) throw new Error("failed to send file-complete");
+        await sendCommit();
+      }
+
+      const verifyDeadline = Date.now() + SECURITY_LIMITS.REQUEST_TIMEOUT_MS;
+      while (!outState.fileVerifyResult && Date.now() < verifyDeadline && !outState.cancelled) {
+        if (outState.retransmitQueue.length > 0) {
+          const missingIdx = outState.retransmitQueue.shift();
+          const cInfo = chunkMap.get(missingIdx);
+          if (cInfo) {
+            await sendSingleChunkByInfo(missingIdx, cInfo);
+            await sendCommit();
+          }
+        }
+        await outState.waitForEvent(250);
+      }
+
+      if (outState.cancelled) throw new Error(outState.cancelReason || "cancelled");
+      if (!outState.fileVerifyResult || !outState.fileVerifyResult.ok) {
+        const errMsg = outState.fileVerifyResult?.error || "การตรวจสอบความสมบูรณ์ของไฟล์ (SHA-256) ล้มเหลว";
+        updateTransferPanelFile(transferId, fileIndex, file.size, "✕ ตรวจสอบไม่ผ่าน");
+        toast(errMsg);
+        return false;
+      }
+
+      chunkMap.clear();
+      updateTransferPanelFile(transferId, fileIndex, file.size, "✓ สำเร็จ (SHA-256)");
+    }
+
+    setProgress(peerId, null);
+    toast(
+      tx.mode === "relay"
+        ? "ส่งและตรวจสอบ SHA-256 สำเร็จ (เข้ารหัส E2EE ผ่าน Relay)"
+        : "ส่งและตรวจสอบ SHA-256 สำเร็จ (เข้ารหัส E2EE P2P)"
+    );
+    return true;
+  } catch (err) {
+    setProgress(peerId, null);
+    if (!outState.cancelled) {
+      toast("การส่งไฟล์ล้มเหลวหรือการเชื่อมต่อถูกตัด");
+    }
+    return false;
+  } finally {
+    activeOutgoingTransfers.delete(transferId);
+    hideTransferPanelIfIdle(transferId);
+    releaseWakeLockIfIdle();
+  }
 }
 
 async function sendText(peerId, presetText = null) {
@@ -1644,52 +2867,64 @@ async function sendPendingShare(peerId) {
 }
 
 // ================= รับข้อมูลที่เข้ารหัส & ตรวจสอบความถูกต้อง =================
-async function onP2PMessage(peerId, rawData) {
-  try {
-    if (typeof rawData === "string") {
-      if (rawData.length > 131072) return;
-      const pkt = JSON.parse(rawData);
-      if (!pkt || typeof pkt !== "object") return;
-      if (pkt.type === "e2ee-init" || pkt.type === "e2ee-ack" || pkt.type === "e2ee-confirm") {
-        await handleE2EEHandshake(peerId, pkt);
-      } else if (pkt.type === "enc-control") {
-        const decryptedMsg = await decryptControlMessage(peerId, pkt);
-        onDecryptedControl(peerId, decryptedMsg);
-      } else if (pkt.type === "enc-chunk") {
-        await onEncryptedChunk(peerId, pkt);
-      }
-      return;
-    }
-
-    if (isArrayBufferLike(rawData)) {
-      if (rawData.byteLength > SECURITY_LIMITS.MAX_CHUNK_SIZE + 256) {
-        abortPeerTransfer(peerId, "ขนาด Chunk เกินขีดจำกัดที่อนุญาต");
+function onP2PMessage(peerId, rawData) {
+  return enqueuePeerRx(peerId, async () => {
+    try {
+      if (typeof rawData === "string") {
+        if (rawData.length > 131072) return;
+        const pkt = JSON.parse(rawData);
+        if (!pkt || typeof pkt !== "object") return;
+        if (pkt.type === "e2ee-init" || pkt.type === "e2ee-ack" || pkt.type === "e2ee-confirm") {
+          await handleE2EEHandshake(peerId, pkt);
+        } else if (pkt.type === "enc-control") {
+          const decryptedMsg = await decryptControlMessage(peerId, pkt);
+          await onDecryptedControl(peerId, decryptedMsg);
+        } else if (pkt.type === "enc-chunk") {
+          await onEncryptedChunk(peerId, pkt);
+        }
         return;
       }
-      const pkt = unpackEncryptedChunkBinary(rawData);
-      await onEncryptedChunk(peerId, pkt);
+
+      if (isArrayBufferLike(rawData)) {
+        if (rawData.byteLength > SECURITY_LIMITS.MAX_CHUNK_SIZE + 512) {
+          abortPeerTransfer(peerId, "ขนาด Chunk เกินขีดจำกัดที่อนุญาต");
+          return;
+        }
+        const headerByte = new Uint8Array(rawData, 0, 1)[0];
+        if (headerByte === 0xe3) {
+          const reassembled = reassembleSctpFragment(peerId, rawData);
+          if (!reassembled) return;
+          const pkt = unpackEncryptedChunkBinary(reassembled);
+          await onEncryptedChunk(peerId, pkt);
+          return;
+        }
+        const pkt = unpackEncryptedChunkBinary(rawData);
+        await onEncryptedChunk(peerId, pkt);
+      }
+    } catch (err) {
+      console.error("P2P message error:", err);
+      abortPeerTransfer(peerId, "การตรวจสอบความปลอดภัยของข้อมูลล้มเหลว");
     }
-  } catch (err) {
-    console.error("P2P message error:", err);
-    abortPeerTransfer(peerId, "การตรวจสอบความปลอดภัยของข้อมูลล้มเหลว");
-  }
+  });
 }
 
-async function onRelayMessage(peerId, data) {
-  if (!data || typeof data !== "object") return;
-  try {
-    if (data.type === "e2ee-init" || data.type === "e2ee-ack" || data.type === "e2ee-confirm") {
-      await handleE2EEHandshake(peerId, data);
-    } else if (data.type === "enc-control") {
-      const decryptedMsg = await decryptControlMessage(peerId, data);
-      onDecryptedControl(peerId, decryptedMsg);
-    } else if (data.type === "enc-chunk") {
-      await onEncryptedChunk(peerId, data);
+function onRelayMessage(peerId, data) {
+  if (!data || typeof data !== "object") return Promise.resolve();
+  return enqueuePeerRx(peerId, async () => {
+    try {
+      if (data.type === "e2ee-init" || data.type === "e2ee-ack" || data.type === "e2ee-confirm") {
+        await handleE2EEHandshake(peerId, data);
+      } else if (data.type === "enc-control") {
+        const decryptedMsg = await decryptControlMessage(peerId, data);
+        await onDecryptedControl(peerId, decryptedMsg);
+      } else if (data.type === "enc-chunk") {
+        await onEncryptedChunk(peerId, data);
+      }
+    } catch (err) {
+      console.error("Relay message error:", err);
+      abortPeerTransfer(peerId, "การตรวจสอบความปลอดภัยของข้อมูลล้มเหลว");
     }
-  } catch (err) {
-    console.error("Relay message error:", err);
-    abortPeerTransfer(peerId, "การตรวจสอบความปลอดภัยของข้อมูลล้มเหลว");
-  }
+  });
 }
 
 function abortPeerTransfer(peerId, userReason) {
@@ -1703,9 +2938,10 @@ function abortPeerTransfer(peerId, userReason) {
 
 function resetIncomingWatchdog(peerId, f) {
   clearTimeout(f.timer);
+  const timeoutMs = f.paused ? SECURITY_LIMITS.PAUSE_TIMEOUT_MS : SECURITY_LIMITS.CHUNK_INACTIVITY_TIMEOUT_MS;
   f.timer = setTimeout(() => {
     abortPeerTransfer(peerId, `การรับไฟล์ ${f.meta.name} หมดเวลาเชื่อมต่อ`);
-  }, SECURITY_LIMITS.CHUNK_INACTIVITY_TIMEOUT_MS);
+  }, timeoutMs);
 }
 
 function checkPeerControlRate(peerId) {
@@ -1732,9 +2968,21 @@ function refreshAcceptedTransferTimer(approved) {
   }, SECURITY_LIMITS.REQUEST_TIMEOUT_MS);
 }
 
-function onDecryptedControl(peerId, msg) {
+const FLOW_CONTROL_TYPES = new Set([
+  "chunk-ack",
+  "chunk-nak",
+  "file-complete",
+  "file-verified",
+  "resume-request",
+  "resume-response",
+  "transfer-pause",
+  "transfer-resume",
+  "transfer-cancel",
+]);
+
+async function onDecryptedControl(peerId, msg) {
   if (!msg || typeof msg !== "object") return;
-  if (!checkPeerControlRate(peerId)) return;
+  if (!FLOW_CONTROL_TYPES.has(msg.type) && !checkPeerControlRate(peerId)) return;
 
   if (msg.type === "text") {
     if (typeof msg.text !== "string" || !msg.text.trim()) return;
@@ -1744,7 +2992,7 @@ function onDecryptedControl(peerId, msg) {
   }
 
   if (msg.type === "file-request") {
-    const check = validateIncomingFileRequest(msg);
+    const check = validateIncomingFileRequest(msg, msg.transportMode || "p2p");
     if (!check.ok) return;
     if (!rememberSeenRequest(check.transferId)) return;
 
@@ -1756,9 +3004,18 @@ function onDecryptedControl(peerId, msg) {
       return;
     }
 
+    // Check browser storage quota before prompting user for large transfers
+    const quotaCheck = await checkStorageQuota(check.totalBytes);
+    if (!quotaCheck.ok) {
+      toast(quotaCheck.error);
+      sendEncryptedFileResponse(peerId, check.transferId, false, "insufficient-storage").catch(() => {});
+      return;
+    }
+
     const reqEntry = {
       peerId,
       transferId: check.transferId,
+      transportMode: msg.transportMode === "relay" ? "relay" : "p2p",
       files: check.files,
       totalBytes: check.totalBytes,
       createdAt: Date.now(),
@@ -1787,8 +3044,207 @@ function onDecryptedControl(peerId, msg) {
     // Verify response actually came from the expected target peer
     if (pending && pending.peerId === peerId) {
       pendingResponses.delete(msg.transferId);
-      pending.resolve(Boolean(msg.accepted));
+      pending.resolve(
+        msg.reason
+          ? { accepted: Boolean(msg.accepted), reason: String(msg.reason) }
+          : Boolean(msg.accepted)
+      );
     }
+    return;
+  }
+
+  if (msg.type === "chunk-ack") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const out = activeOutgoingTransfers.get(msg.transferId);
+    if (!out || out.peerId !== peerId || msg.fileIndex !== out.currentFileIndex) return;
+    if (Number.isSafeInteger(msg.chunkIndex) && msg.chunkIndex > out.ackedChunkIndex) {
+      out.ackedChunkIndex = msg.chunkIndex;
+    }
+    if (Number.isSafeInteger(msg.receivedBytes) && msg.receivedBytes > out.ackedBytes) {
+      out.ackedBytes = msg.receivedBytes;
+    }
+    out.wakeWaiters?.();
+    return;
+  }
+
+  if (msg.type === "chunk-nak") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const out = activeOutgoingTransfers.get(msg.transferId);
+    if (!out || out.peerId !== peerId || msg.fileIndex !== out.currentFileIndex) return;
+    if (
+      Number.isSafeInteger(msg.missingChunkIndex) &&
+      msg.missingChunkIndex >= 0 &&
+      !out.retransmitQueue.includes(msg.missingChunkIndex)
+    ) {
+      out.retransmitQueue.push(msg.missingChunkIndex);
+      out.wakeWaiters?.();
+    }
+    return;
+  }
+
+  if (msg.type === "resume-request") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const f = incoming.get(peerId);
+    const approved = acceptedTransfers.get(msg.transferId);
+    if (!approved || approved.peerId !== peerId) {
+      sendControlBestEffort(peerId, {
+        type: "resume-response",
+        transferId: msg.transferId,
+        fileIndex: msg.fileIndex,
+        canResume: false,
+      });
+      return;
+    }
+    if (f && f.transferId === msg.transferId && f.fileIndex === msg.fileIndex) {
+      resetIncomingWatchdog(peerId, f);
+      sendControlBestEffort(peerId, {
+        type: "resume-response",
+        transferId: msg.transferId,
+        fileIndex: f.fileIndex,
+        canResume: true,
+        nextChunkIndex: f.expectedChunkIndex,
+        receivedBytes: f.received,
+      });
+    } else {
+      sendControlBestEffort(peerId, {
+        type: "resume-response",
+        transferId: msg.transferId,
+        fileIndex: msg.fileIndex,
+        canResume: true,
+        nextChunkIndex: 0,
+        receivedBytes: 0,
+      });
+    }
+    return;
+  }
+
+  if (msg.type === "resume-response") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const out = activeOutgoingTransfers.get(msg.transferId);
+    if (!out || out.peerId !== peerId) return;
+    out.resumeTarget = {
+      fileIndex: msg.fileIndex,
+      canResume: Boolean(msg.canResume),
+      nextChunkIndex: Number.isSafeInteger(msg.nextChunkIndex) ? msg.nextChunkIndex : 0,
+      receivedBytes: Number.isSafeInteger(msg.receivedBytes) ? msg.receivedBytes : 0,
+    };
+    out.wakeWaiters?.();
+    return;
+  }
+
+  if (msg.type === "transfer-pause") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const out = activeOutgoingTransfers.get(msg.transferId);
+    if (out && out.peerId === peerId) {
+      out.paused = true;
+      if (currentUiTransfer?.transferId === msg.transferId) {
+        currentUiTransfer.paused = true;
+        if ($("#pauseTransferBtn")) $("#pauseTransferBtn").hidden = true;
+        if ($("#resumeTransferBtn")) $("#resumeTransferBtn").hidden = false;
+        updateTransferPanelStats(currentUiTransfer.transferredBytes);
+      }
+      setStatus(peerId, "อีกฝ่ายพักการรับ-ส่งไฟล์ชั่วคราว");
+      return;
+    }
+    const f = incoming.get(peerId);
+    if (f && f.transferId === msg.transferId) {
+      f.paused = true;
+      resetIncomingWatchdog(peerId, f);
+      if (currentUiTransfer?.transferId === msg.transferId) {
+        currentUiTransfer.paused = true;
+        if ($("#pauseTransferBtn")) $("#pauseTransferBtn").hidden = true;
+        if ($("#resumeTransferBtn")) $("#resumeTransferBtn").hidden = false;
+        updateTransferPanelStats(currentUiTransfer.transferredBytes);
+      }
+      setStatus(peerId, "ผู้ส่งพักการส่งไฟล์ชั่วคราว");
+    }
+    return;
+  }
+
+  if (msg.type === "transfer-resume") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const out = activeOutgoingTransfers.get(msg.transferId);
+    if (out && out.peerId === peerId) {
+      out.paused = false;
+      if (
+        Number.isSafeInteger(msg.fileIndex) &&
+        msg.fileIndex === out.currentFileIndex &&
+        Number.isSafeInteger(msg.nextChunkIndex) &&
+        Number.isSafeInteger(msg.receivedBytes)
+      ) {
+        out.resumeTarget = {
+          fileIndex: msg.fileIndex,
+          canResume: true,
+          nextChunkIndex: msg.nextChunkIndex,
+          receivedBytes: msg.receivedBytes,
+        };
+      }
+      if (currentUiTransfer?.transferId === msg.transferId) {
+        currentUiTransfer.paused = false;
+        if ($("#pauseTransferBtn")) $("#pauseTransferBtn").hidden = false;
+        if ($("#resumeTransferBtn")) $("#resumeTransferBtn").hidden = true;
+      }
+      out.wakeWaiters?.();
+      return;
+    }
+    const f = incoming.get(peerId);
+    if (f && f.transferId === msg.transferId) {
+      f.paused = false;
+      resetIncomingWatchdog(peerId, f);
+      if (currentUiTransfer?.transferId === msg.transferId) {
+        currentUiTransfer.paused = false;
+        if ($("#pauseTransferBtn")) $("#pauseTransferBtn").hidden = false;
+        if ($("#resumeTransferBtn")) $("#resumeTransferBtn").hidden = true;
+      }
+    }
+    return;
+  }
+
+  if (msg.type === "transfer-cancel") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    cancelActiveTransfer(msg.transferId, false);
+    toast("อีกฝ่ายยกเลิกการรับ-ส่งไฟล์");
+    return;
+  }
+
+  if (msg.type === "file-complete") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const f = incoming.get(peerId);
+    if (!f || f.transferId !== msg.transferId || f.fileIndex !== msg.fileIndex) return;
+    if (typeof msg.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(msg.sha256)) {
+      abortPeerTransfer(peerId, "ข้อมูลตรวจสอบความสมบูรณ์ของไฟล์ (SHA-256) ไม่ถูกต้อง");
+      return;
+    }
+    f.commitMsg = {
+      sha256: msg.sha256.toLowerCase(),
+      size: msg.size,
+      totalChunks: msg.totalChunks,
+    };
+    if (f.allBytesReceived) {
+      await verifyAndCommitIncomingFile(peerId, f);
+    } else if (Number.isSafeInteger(msg.totalChunks) && f.expectedChunkIndex < msg.totalChunks) {
+      // Request missing chunk if sender thought it was done
+      sendControlBestEffort(peerId, {
+        type: "chunk-nak",
+        transferId: f.transferId,
+        fileIndex: f.fileIndex,
+        missingChunkIndex: f.expectedChunkIndex,
+        receivedBytes: f.received,
+      });
+    }
+    return;
+  }
+
+  if (msg.type === "file-verified") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const out = activeOutgoingTransfers.get(msg.transferId);
+    if (!out || out.peerId !== peerId || msg.fileIndex !== out.currentFileIndex) return;
+    out.fileVerifyResult = {
+      ok: Boolean(msg.ok),
+      sha256: msg.sha256 || "",
+      error: msg.error || "",
+    };
+    out.wakeWaiters?.();
     return;
   }
 
@@ -1796,6 +3252,18 @@ function onDecryptedControl(peerId, msg) {
     if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
     const approved = acceptedTransfers.get(msg.transferId);
     if (!approved || approved.peerId !== peerId) return;
+
+    // If same file header is re-sent during reconnect/resume, ignore duplicate header safely
+    const existingIncoming = incoming.get(peerId);
+    if (
+      existingIncoming &&
+      existingIncoming.transferId === msg.transferId &&
+      existingIncoming.fileIndex === msg.fileIndex &&
+      existingIncoming.resumable
+    ) {
+      resetIncomingWatchdog(peerId, existingIncoming);
+      return;
+    }
 
     // Prevent starting a new file while another file from this peer is still incomplete
     if (incoming.has(peerId)) {
@@ -1811,6 +3279,10 @@ function onDecryptedControl(peerId, msg) {
 
     const approvedFile = approved.files[expectedFileIndex];
     const cleanHeaderName = sanitizeFilename(msg.name);
+    const isRelayMode = msg.transportMode === "relay" || approved.transportMode === "relay";
+    const maxAllowedSize = isRelayMode
+      ? Math.min(SECURITY_LIMITS.MAX_FILE_SIZE, SECURITY_LIMITS.MAX_RELAY_FILE_SIZE)
+      : SECURITY_LIMITS.MAX_FILE_SIZE;
 
     // Strictly verify that header metadata matches what the user approved in the modal
     if (
@@ -1818,10 +3290,10 @@ function onDecryptedControl(peerId, msg) {
       msg.size !== approvedFile.size ||
       !Number.isSafeInteger(msg.size) ||
       msg.size < 0 ||
-      msg.size > SECURITY_LIMITS.MAX_FILE_SIZE
+      msg.size > maxAllowedSize
     ) {
       cleanupAcceptedTransfer(msg.transferId);
-      toast("ปฏิเสธไฟล์: ข้อมูลไฟล์ไม่ตรงกับที่ขออนุญาตไว้");
+      toast("ปฏิเสธไฟล์: ข้อมูลไฟล์ไม่ตรงกับที่ขออนุญาตไว้หรือเกินขีดจำกัด");
       return;
     }
 
@@ -1836,17 +3308,68 @@ function onDecryptedControl(peerId, msg) {
       fileIndex: expectedFileIndex,
       meta: approvedFile,
       chunks: [],
+      storage: null,
+      hasher: new IntegrityHasher(),
+      resumable: Boolean(msg.resumable),
+      requiresCommit: Boolean(msg.requiresCommit),
+      allBytesReceived: approvedFile.size === 0,
+      commitMsg: null,
+      outOfOrderChunks: new Map(),
+      duplicateCount: 0,
+      paused: false,
       received: 0,
       expectedChunkIndex: 0,
       timer: null,
     };
     incoming.set(peerId, fState);
+    fState.storage = await createReceiverFileStorage(msg.transferId, expectedFileIndex, approvedFile);
+    updateTransferPanelFile(msg.transferId, expectedFileIndex, 0, "กำลังรับ");
 
     if (approvedFile.size === 0) {
-      finishFile(peerId);
+      if (!fState.requiresCommit) {
+        await finishFile(peerId);
+      } else {
+        resetIncomingWatchdog(peerId, fState);
+      }
     } else {
       resetIncomingWatchdog(peerId, fState);
     }
+  }
+}
+
+async function verifyAndCommitIncomingFile(peerId, f) {
+  if (!f || f.verifying || !f.allBytesReceived || !f.commitMsg) return;
+  f.verifying = true;
+  try {
+    updateTransferPanelFile(f.transferId, f.fileIndex, f.received, "กำลังตรวจสอบ SHA-256...");
+    const actualSha256 = await f.hasher.finalize();
+    if (
+      f.received !== f.meta.size ||
+      f.commitMsg.size !== f.meta.size ||
+      actualSha256.toLowerCase() !== f.commitMsg.sha256.toLowerCase()
+    ) {
+      await sendControlBestEffort(peerId, {
+        type: "file-verified",
+        transferId: f.transferId,
+        fileIndex: f.fileIndex,
+        ok: false,
+        error: "SHA-256 integrity verification failed",
+      });
+      abortPeerTransfer(peerId, `ตรวจพบไฟล์ ${f.meta.name} เสียหายหรือไม่สมบูรณ์ (SHA-256 ไม่ตรงกัน)`);
+      return;
+    }
+
+    await finishFile(peerId, actualSha256);
+    await sendControlBestEffort(peerId, {
+      type: "file-verified",
+      transferId: f.transferId,
+      fileIndex: f.fileIndex,
+      ok: true,
+      sha256: actualSha256,
+    });
+  } catch (err) {
+    console.error("Verify and commit error:", err);
+    abortPeerTransfer(peerId, "การตรวจสอบความสมบูรณ์ของไฟล์ล้มเหลว");
   }
 }
 
@@ -1854,11 +3377,7 @@ async function onEncryptedChunk(peerId, packet) {
   const f = incoming.get(peerId);
   if (!f) return;
 
-  if (
-    packet.transferId !== f.transferId ||
-    packet.fileIndex !== f.fileIndex ||
-    packet.chunkIndex !== f.expectedChunkIndex
-  ) {
+  if (packet.transferId !== f.transferId || packet.fileIndex !== f.fileIndex) {
     abortPeerTransfer(peerId, "ตรวจพบลำดับข้อมูลไฟล์ผิดปกติหรือซ้ำซ้อน");
     return;
   }
@@ -1866,6 +3385,12 @@ async function onEncryptedChunk(peerId, packet) {
   const approved = acceptedTransfers.get(f.transferId);
   if (!approved || approved.peerId !== peerId) {
     abortPeerTransfer(peerId, "ไม่พบสิทธิ์การส่งไฟล์นี้");
+    return;
+  }
+
+  // Legacy non-resumable headers enforce strict immediate sequential chunkIndex check before decryption
+  if (!f.resumable && packet.chunkIndex !== f.expectedChunkIndex) {
+    abortPeerTransfer(peerId, "ตรวจพบลำดับข้อมูลไฟล์ผิดปกติหรือซ้ำซ้อน");
     return;
   }
 
@@ -1877,42 +3402,123 @@ async function onEncryptedChunk(peerId, packet) {
     return;
   }
 
-  if (
-    f.received + plainBuf.byteLength > f.meta.size ||
-    approved.receivedTotalBytes + plainBuf.byteLength > approved.totalBytes
-  ) {
-    abortPeerTransfer(peerId, "ผู้ส่งส่งข้อมูลเกินขนาดไฟล์ที่ระบุไว้");
-    return;
-  }
-
-  f.chunks.push(plainBuf);
-  f.received += plainBuf.byteLength;
-  f.expectedChunkIndex += 1;
-  approved.receivedTotalBytes += plainBuf.byteLength;
-  refreshAcceptedTransferTimer(approved);
-
-  if (packet.last && f.received !== f.meta.size) {
-    abortPeerTransfer(peerId, "ข้อมูลไฟล์ไม่ครบตามขนาดที่ระบุ");
-    return;
-  }
-  if (!packet.last && f.received >= f.meta.size) {
-    abortPeerTransfer(peerId, "โครงสร้างข้อมูลไฟล์ไม่ถูกต้อง");
-    return;
-  }
-
-  setProgress(peerId, f.received / f.meta.size, `รับและถอดรหัส ${f.meta.name}`);
-
-  if (packet.last && f.received === f.meta.size) {
-    finishFile(peerId);
-  } else {
+  // 1. Duplicate chunk detection (legitimate sender retransmission of an already-written chunkIndex)
+  if (f.resumable && packet.chunkIndex < f.expectedChunkIndex) {
+    f.duplicateCount += 1;
+    sendControlBestEffort(peerId, {
+      type: "chunk-ack",
+      transferId: f.transferId,
+      fileIndex: f.fileIndex,
+      chunkIndex: f.expectedChunkIndex - 1,
+      receivedBytes: f.received,
+    });
     resetIncomingWatchdog(peerId, f);
+    return;
   }
+
+  // 2. Missing chunk detection & out-of-order buffering (requests retransmission via chunk-nak)
+  if (f.resumable && packet.chunkIndex > f.expectedChunkIndex) {
+    const gap = packet.chunkIndex - f.expectedChunkIndex;
+    if (gap > SECURITY_LIMITS.MAX_OUT_OF_ORDER_CHUNKS) {
+      abortPeerTransfer(peerId, "ตรวจพบข้อมูลสูญหายเกินขีดจำกัดระหว่างส่ง");
+      return;
+    }
+    if (!f.outOfOrderChunks.has(packet.chunkIndex)) {
+      f.outOfOrderChunks.set(packet.chunkIndex, { packet, plainBuf });
+    }
+    sendControlBestEffort(peerId, {
+      type: "chunk-nak",
+      transferId: f.transferId,
+      fileIndex: f.fileIndex,
+      missingChunkIndex: f.expectedChunkIndex,
+      receivedBytes: f.received,
+    });
+    resetIncomingWatchdog(peerId, f);
+    return;
+  }
+
+  // 3. Process current in-order chunk and any consecutive buffered out-of-order chunks
+  const queueToProcess = [{ packet, plainBuf }];
+  while (f.outOfOrderChunks.has(f.expectedChunkIndex + queueToProcess.length)) {
+    const nextIdx = f.expectedChunkIndex + queueToProcess.length;
+    queueToProcess.push(f.outOfOrderChunks.get(nextIdx));
+    f.outOfOrderChunks.delete(nextIdx);
+  }
+
+  for (const item of queueToProcess) {
+    const curPkt = item.packet;
+    const curBuf = item.plainBuf;
+
+    if (
+      f.received + curBuf.byteLength > f.meta.size ||
+      approved.receivedTotalBytes + curBuf.byteLength > approved.totalBytes
+    ) {
+      abortPeerTransfer(peerId, "ผู้ส่งส่งข้อมูลเกินขนาดไฟล์ที่ระบุไว้");
+      return;
+    }
+
+    await f.hasher.update(curBuf);
+    if (f.storage) {
+      await f.storage.writeChunk(curBuf);
+    } else {
+      f.chunks.push(curBuf);
+    }
+
+    f.received += curBuf.byteLength;
+    f.expectedChunkIndex += 1;
+    approved.receivedTotalBytes += curBuf.byteLength;
+    refreshAcceptedTransferTimer(approved);
+
+    if (curPkt.last && f.received !== f.meta.size) {
+      abortPeerTransfer(peerId, "ข้อมูลไฟล์ไม่ครบตามขนาดที่ระบุ");
+      return;
+    }
+    if (!curPkt.last && f.received >= f.meta.size) {
+      abortPeerTransfer(peerId, "โครงสร้างข้อมูลไฟล์ไม่ถูกต้อง");
+      return;
+    }
+
+    if (f.resumable) {
+      // Send chunk-ack at least every 1 MB or on the final chunk to avoid flooding control channel on 64KB Relay chunks
+      const ackStep = Math.max(256 * 1024, Math.floor(SECURITY_LIMITS.MAX_IN_FLIGHT_BYTES / 8));
+      if (curPkt.last || curPkt.chunkIndex === 0 || f.received - (f.lastAckedBytes || 0) >= ackStep) {
+        f.lastAckedBytes = f.received;
+        sendControlBestEffort(peerId, {
+          type: "chunk-ack",
+          transferId: f.transferId,
+          fileIndex: f.fileIndex,
+          chunkIndex: curPkt.chunkIndex,
+          receivedBytes: f.received,
+        });
+      }
+    }
+
+    setProgress(peerId, f.received / f.meta.size, `รับและถอดรหัส ${f.meta.name}`);
+    updateTransferPanelFile(f.transferId, f.fileIndex, f.received, "กำลังรับ");
+
+    if (curPkt.last && f.received === f.meta.size) {
+      f.allBytesReceived = true;
+      if (f.requiresCommit) {
+        if (f.commitMsg) {
+          await verifyAndCommitIncomingFile(peerId, f);
+        } else {
+          resetIncomingWatchdog(peerId, f);
+        }
+      } else {
+        await finishFile(peerId);
+      }
+      return;
+    }
+  }
+
+  resetIncomingWatchdog(peerId, f);
 }
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function processRequestQueue() {
@@ -1961,8 +3567,13 @@ function processRequestQueue() {
   $("#confirmModal").style.display = "flex";
 }
 
-async function sendEncryptedFileResponse(peerId, transferId, accepted) {
-  const reply = { type: "file-response", transferId, accepted: Boolean(accepted) };
+async function sendEncryptedFileResponse(peerId, transferId, accepted, reason = "") {
+  const reply = {
+    type: "file-response",
+    transferId,
+    accepted: Boolean(accepted),
+    ...(reason ? { reason: String(reason) } : {}),
+  };
   const encPkt = await encryptControlMessage(peerId, reply);
   const c = conns.get(peerId);
   let sentP2P = false;
@@ -1985,15 +3596,29 @@ async function respondToActiveRequest(accepted) {
   activeRequest = null;
   $("#confirmModal").style.display = "none";
 
-  const { peerId, transferId, files, totalBytes } = req;
+  const { peerId, transferId, transportMode, files, totalBytes } = req;
 
   if (accepted) {
+    const quotaCheck = await checkStorageQuota(totalBytes);
+    if (!quotaCheck.ok) {
+      toast(quotaCheck.error);
+      try {
+        await sendEncryptedFileResponse(peerId, transferId, false, "insufficient-storage");
+      } catch {}
+      processRequestQueue();
+      return;
+    }
+
+    await acquireWakeLock();
+    initTransferPanel(transferId, peerId, "receive", transportMode || "p2p", files, totalBytes);
+
     const timer = setTimeout(() => {
       cleanupAcceptedTransfer(transferId);
     }, SECURITY_LIMITS.REQUEST_TIMEOUT_MS);
 
     acceptedTransfers.set(transferId, {
       peerId,
+      transportMode: transportMode || "p2p",
       files,
       nextFileIndex: 0,
       totalBytes,
@@ -2015,28 +3640,45 @@ async function respondToActiveRequest(accepted) {
 $("#acceptBtn").onclick = () => respondToActiveRequest(true);
 $("#rejectBtn").onclick = () => respondToActiveRequest(false);
 
-function finishFile(peerId) {
+async function finishFile(peerId, verifiedSha256 = null) {
   const f = incoming.get(peerId);
   if (!f) return;
   clearTimeout(f.timer);
   incoming.delete(peerId);
 
   const approved = acceptedTransfers.get(f.transferId);
+  let allFilesComplete = true;
   if (approved) {
     if (approved.nextFileIndex >= approved.files.length) {
       cleanupAcceptedTransfer(f.transferId);
     } else {
+      allFilesComplete = false;
       refreshAcceptedTransferTimer(approved);
     }
   }
 
   const safeMime = getSafeDownloadMime(f.meta.name, f.meta.mime);
-  const blob = new Blob(f.chunks, { type: safeMime });
+  let blob;
+  if (f.storage) {
+    blob = await f.storage.finalize(safeMime);
+    f.storage = null;
+  } else {
+    blob = new Blob(f.chunks, { type: safeMime });
+  }
   f.chunks = [];
+  f.outOfOrderChunks?.clear?.();
 
-  addReceivedFile(peerName(peerId), f.meta.name, blob, f.meta.dangerous);
+  const finalHash = verifiedSha256 || (await f.hasher.finalize());
+  blob.sha256 = finalHash;
+
+  updateTransferPanelFile(f.transferId, f.fileIndex, f.meta.size, "✓ สำเร็จ (SHA-256)");
+  addReceivedFile(peerName(peerId), f.meta.name, blob, f.meta.dangerous, finalHash);
   setProgress(peerId, null);
-  toast(`ได้รับ ${f.meta.name}`);
+  if (allFilesComplete) {
+    hideTransferPanelIfIdle(f.transferId);
+    releaseWakeLockIfIdle();
+  }
+  toast(`ได้รับ ${f.meta.name} (ตรวจสอบความสมบูรณ์แล้ว)`);
 }
 
 // ================= UI =================
@@ -2204,12 +3846,13 @@ function setProgress(peerId, ratio, label = "") {
   setStatus(peerId, `${label} ${Math.round(ratio * 100)}%`);
 }
 
-function registerObjectUrl(url, itemElement) {
-  activeObjectUrls.push({ url, itemElement });
+function registerObjectUrl(url, itemElement, cleanup = null) {
+  activeObjectUrls.push({ url, itemElement, cleanup });
   while (activeObjectUrls.length > SECURITY_LIMITS.MAX_RETAINED_BLOBS) {
     const oldest = activeObjectUrls.shift();
     if (oldest) {
       try { URL.revokeObjectURL(oldest.url); } catch {}
+      try { oldest.cleanup?.(); } catch {}
       oldest.itemElement?.remove();
     }
   }
@@ -2218,7 +3861,10 @@ function registerObjectUrl(url, itemElement) {
 function revokeAndRemoveItem(url, itemElement) {
   try { URL.revokeObjectURL(url); } catch {}
   const idx = activeObjectUrls.findIndex((e) => e.url === url);
-  if (idx !== -1) activeObjectUrls.splice(idx, 1);
+  if (idx !== -1) {
+    const [removed] = activeObjectUrls.splice(idx, 1);
+    try { removed?.cleanup?.(); } catch {}
+  }
   itemElement.remove();
 }
 
@@ -2240,16 +3886,25 @@ function enforceReceivedInboxCap() {
   }
 }
 
-function addReceivedFile(from, name, blob, isDangerous = false) {
+function addReceivedFile(from, name, blob, isDangerous = false, sha256 = "") {
   const safeName = sanitizeFilename(name);
   const dangerous = isDangerous || isDangerousFile(safeName, blob.type);
 
   const item = document.createElement("div");
   item.className = "item";
+  item.dataset.filename = safeName;
+  item.dataset.filesize = String(blob.size);
+  if (sha256 || blob.sha256) {
+    item.dataset.sha256 = sha256 || blob.sha256;
+  }
+  item._blob = blob;
 
   const infoWrap = document.createElement("div");
   const info = document.createElement("div");
-  info.textContent = `${safeName} (${formatSize(blob.size)}) จาก ${from}`;
+  const shortHash = (sha256 || blob.sha256 || "").slice(0, 12);
+  info.textContent = shortHash
+    ? `${safeName} (${formatSize(blob.size)}) จาก ${from} • SHA-256: ${shortHash}…`
+    : `${safeName} (${formatSize(blob.size)}) จาก ${from}`;
   infoWrap.appendChild(info);
 
   if (dangerous) {
@@ -2286,7 +3941,7 @@ function addReceivedFile(from, name, blob, isDangerous = false) {
 
   actions.append(a, dismissBtn);
   item.append(infoWrap, actions);
-  registerObjectUrl(objUrl, item);
+  registerObjectUrl(objUrl, item, blob._opfsCleanup || null);
   $("#received").prepend(item);
   enforceReceivedInboxCap();
 }
@@ -2399,6 +4054,18 @@ window.MyDropSecurity = {
   buildDeterministicIv,
   packEncryptedChunkBinary,
   unpackEncryptedChunkBinary,
+  splitBinaryFrameForSctp,
+  reassembleSctpFragment,
+  IntegrityHasher,
+  computeBlobSha256,
+  AdaptiveChunkSizer,
+  createReceiverFileStorage,
+  checkStorageQuota,
+  detectPlatformCapabilities,
+  formatSize,
+  pauseActiveTransfer,
+  resumeActiveTransfer,
+  cancelActiveTransfer,
   generateSecureRoomCode,
 };
 

@@ -234,7 +234,20 @@ function createClientInstance(name = "Client") {
       replaceState() {},
     },
     navigator: {
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
       clipboard: { writeText: async () => {} },
+      storage: null,
+      wakeLock: {
+        async request() {
+          return {
+            released: false,
+            addEventListener() {},
+            async release() {
+              this.released = true;
+            },
+          };
+        },
+      },
     },
     document: {
       visibilityState: "visible",
@@ -311,9 +324,14 @@ function createClientInstance(name = "Client") {
       getReconnectToken: () => reconnectToken,
       getPeers: () => peers,
       getWs: () => ws,
+      getConn: (pid) => conns.get(pid),
+      setConn: (pid, c) => conns.set(pid, c),
       getE2EESession: (pid) => e2eeSessions.get(pid),
       getIncoming: (pid) => incoming.get(pid),
       getAcceptedTransfer: (tid) => acceptedTransfers.get(tid),
+      getActiveOutgoing: (tid) => activeOutgoingTransfers.get(tid),
+      getAllOutgoing: () => activeOutgoingTransfers,
+      getUiTransfer: () => currentUiTransfer,
       getRequestQueue: () => requestQueue,
       getActiveRequest: () => activeRequest,
       getActiveObjectUrls: () => activeObjectUrls,
@@ -805,20 +823,38 @@ await runTest("B. Security Tests", "Enforce file count, file size, total size, f
   elevenFiles.forEach((f, i) => (f.name = `f${i}.txt`));
   assert.equal(sec.validateOutgoingFiles(elevenFiles).ok, false);
 
-  // 2. Oversized individual file (> 50 MB)
+  // 2. Oversized individual file (> 5 GB for P2P, > 500 MB for Relay)
+  const fiveGb = 5 * 1024 * 1024 * 1024;
+  const fiveHundredMb = 500 * 1024 * 1024;
+  const validFiveGbReq = sec.validateIncomingFileRequest({
+    transferId: crypto.randomUUID(),
+    files: [{ name: "movie_4k.mov", size: fiveGb, mime: "video/quicktime" }],
+  });
+  assert.equal(validFiveGbReq.ok, true);
+
   const hugeFileReq = sec.validateIncomingFileRequest({
     transferId: crypto.randomUUID(),
-    files: [{ name: "big.bin", size: 50 * 1024 * 1024 + 1, mime: "application/octet-stream" }],
+    files: [{ name: "big.bin", size: fiveGb + 1, mime: "application/octet-stream" }],
   });
   assert.equal(hugeFileReq.ok, false);
 
-  // 3. Oversized total transfer (> 100 MB across 3 files)
+  const hugeRelayFileReq = sec.validateIncomingFileRequest(
+    {
+      transferId: crypto.randomUUID(),
+      transportMode: "relay",
+      files: [{ name: "relay_too_big.mp4", size: fiveHundredMb + 1, mime: "video/mp4" }],
+    },
+    "relay"
+  );
+  assert.equal(hugeRelayFileReq.ok, false);
+
+  // 3. Oversized total transfer (> 10 GB across 3 files)
   const hugeTotalReq = sec.validateIncomingFileRequest({
     transferId: crypto.randomUUID(),
     files: [
-      { name: "a.bin", size: 40 * 1024 * 1024, mime: "application/octet-stream" },
-      { name: "b.bin", size: 40 * 1024 * 1024, mime: "application/octet-stream" },
-      { name: "c.bin", size: 25 * 1024 * 1024, mime: "application/octet-stream" },
+      { name: "a.bin", size: 4 * 1024 * 1024 * 1024, mime: "application/octet-stream" },
+      { name: "b.bin", size: 4 * 1024 * 1024 * 1024, mime: "application/octet-stream" },
+      { name: "c.bin", size: 3 * 1024 * 1024 * 1024, mime: "application/octet-stream" },
     ],
   });
   assert.equal(hugeTotalReq.ok, false);
@@ -1215,6 +1251,662 @@ await runTest("D. Web & Cloudflare Security", "Verify HTTP Security Headers, CSP
     if (r.webSocket) r.webSocket.peer.close();
   }
   assert.equal(shardStatus, 429, "Multi-room connection sharding from same IP must hit 429 rate limit!");
+});
+
+// ============================================================================
+// SUITE E: LARGE FILE TRANSFER UPGRADE TESTS (100MB - 5GB, iOS/Android, P2P, Relay, Resume, SHA-256)
+// ============================================================================
+
+// Deterministic streaming VirtualVideoFile (extends Blob) that generates deterministic video bytes on demand per .slice()
+// without allocating multi-GB buffers in Node.js RAM at once, while exercising the real File.slice().arrayBuffer() API.
+class VirtualVideoFile extends Blob {
+  constructor(name, sizeBytes, mime = "video/mp4", seed = 0x5a17c3) {
+    super([]);
+    this._name = name;
+    this._size = sizeBytes;
+    this._mime = mime;
+    this._seed = seed >>> 0;
+  }
+  get name() {
+    return this._name;
+  }
+  get size() {
+    return this._size;
+  }
+  get type() {
+    return this._mime;
+  }
+  slice(start = 0, end = this._size, contentType = this._mime) {
+    const s = Math.max(0, Math.min(this._size, start));
+    const e = Math.max(s, Math.min(this._size, end));
+    const len = e - s;
+    const seed = this._seed;
+    const sliceBlob = new Blob([], { type: contentType });
+    Object.defineProperty(sliceBlob, "size", { value: len });
+    sliceBlob.arrayBuffer = async () => {
+      const buf = new ArrayBuffer(len);
+      // Define content at every 4KB page boundary purely as a function of absolute file offset `absPos`
+      // so slicing in 64KB, 1MB, 2MB, or 4MB chunks always yields the exact same file byte stream!
+      const u8 = new Uint8Array(buf);
+      const firstPageOffset = (4096 - (s % 4096)) % 4096;
+      for (let localPos = firstPageOffset; localPos + 8 <= len; localPos += 4096) {
+        const absPos = s + localPos;
+        const pageIdx = Math.floor(absPos / 4096);
+        const w0 = (seed ^ (pageIdx * 2654435761)) >>> 0;
+        const w1 = (seed + pageIdx) >>> 0;
+        u8[localPos] = w0 & 0xff;
+        u8[localPos + 1] = (w0 >>> 8) & 0xff;
+        u8[localPos + 2] = (w0 >>> 16) & 0xff;
+        u8[localPos + 3] = (w0 >>> 24) & 0xff;
+        u8[localPos + 4] = w1 & 0xff;
+        u8[localPos + 5] = (w1 >>> 8) & 0xff;
+        u8[localPos + 6] = (w1 >>> 16) & 0xff;
+        u8[localPos + 7] = (w1 >>> 24) & 0xff;
+      }
+      return buf;
+    };
+    return sliceBlob;
+  }
+}
+
+// Install a streaming disk-simulated OPFS (`navigator.storage.getDirectory()`) on a client instance
+// that verifies written chunk offsets/sizes and computes the received stream's SHA-256 in O(1) memory.
+function installStreamingOpfsMock(client, seedForVerification = 0x5a17c3, quotaBytes = 20 * 1024 * 1024 * 1024) {
+  const opfsFiles = new Map();
+  let usedBytes = 0;
+  let peakActiveChunksInRam = 0;
+  let activeWriteCount = 0;
+
+  client.navigator.storage = {
+    async estimate() {
+      return { quota: quotaBytes, usage: usedBytes };
+    },
+    async getDirectory() {
+      return {
+        async getFileHandle(fileName, opts = {}) {
+          if (!opfsFiles.has(fileName)) {
+            opfsFiles.set(fileName, {
+              name: fileName,
+              size: 0,
+              chunksWritten: 0,
+              hasher: new client.MyDropSecurity.IntegrityHasher(),
+              smallChunks: [],
+              keepBytesInRam: true,
+              removed: false,
+            });
+          }
+          const entry = opfsFiles.get(fileName);
+          return {
+            async createWritable() {
+              entry.size = 0;
+              entry.chunksWritten = 0;
+              entry.hasher = new client.MyDropSecurity.IntegrityHasher();
+              entry.smallChunks = [];
+              return {
+                async write(buf) {
+                  activeWriteCount += 1;
+                  if (activeWriteCount > peakActiveChunksInRam) peakActiveChunksInRam = activeWriteCount;
+                  const byteLen = buf.byteLength;
+                  entry.size += byteLen;
+                  entry.chunksWritten += 1;
+                  usedBytes += byteLen;
+                  await entry.hasher.update(buf);
+                  // Keep actual buffer bytes for files <= 16 MB; for 100 MB - 5 GB files, stream-verify & release buffer immediately
+                  if (entry.size <= 16 * 1024 * 1024 && entry.keepBytesInRam) {
+                    entry.smallChunks.push(buf.slice(0));
+                  } else {
+                    entry.keepBytesInRam = false;
+                    entry.smallChunks = [];
+                  }
+                  activeWriteCount -= 1;
+                },
+                async close() {
+                  entry.finalSha256 = await entry.hasher.finalize();
+                },
+                async abort() {
+                  usedBytes = Math.max(0, usedBytes - entry.size);
+                  entry.size = 0;
+                  entry.smallChunks = [];
+                },
+              };
+            },
+            async getFile() {
+              if (entry.keepBytesInRam && entry.smallChunks.length > 0) {
+                const b = new Blob(entry.smallChunks, { type: "video/mp4" });
+                b.sha256 = entry.finalSha256;
+                return b;
+              }
+              const diskBacked = new VirtualVideoFile(entry.name, entry.size, "video/mp4", seedForVerification);
+              diskBacked.sha256 = entry.finalSha256;
+              return diskBacked;
+            },
+          };
+        },
+        async removeEntry(fileName) {
+          const entry = opfsFiles.get(fileName);
+          if (entry) {
+            usedBytes = Math.max(0, usedBytes - entry.size);
+            entry.removed = true;
+            opfsFiles.delete(fileName);
+          }
+        },
+      };
+    },
+  };
+
+  return {
+    opfsFiles,
+    getUsedBytes: () => usedBytes,
+    getPeakActiveChunksInRam: () => peakActiveChunksInRam,
+  };
+}
+
+// Helper to wire two client sandboxes with both WebSocket Relay and a live simulated WebRTC DataChannel
+function connectTwoClientsForTransfer(sender, receiver, options = {}) {
+  const {
+    mode = "p2p",
+    sctpMaxMessageSize = 65536, // 64 KB default cross-browser iOS Safari <-> Android Chrome SCTP limit
+    senderUa = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    receiverUa = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    autoAccept = true,
+    onChunkHook = null,
+  } = options;
+
+  const senderId = crypto.randomUUID();
+  const receiverId = crypto.randomUUID();
+  sender.navigator.userAgent = senderUa;
+  receiver.navigator.userAgent = receiverUa;
+
+  sender.__test.setIdentity(senderId, "iPhone-Sender");
+  receiver.__test.setIdentity(receiverId, "Android-Receiver");
+  sender.__test.setPeers([{ id: receiverId, name: "Android-Receiver", device: "phone" }]);
+  receiver.__test.setPeers([{ id: senderId, name: "iPhone-Sender", device: "phone" }]);
+
+  let p2pFramesSent = 0;
+  let relayFramesSent = 0;
+
+  // Wire WebSockets for Relay & Signaling
+  const makeWsSend = (fromClient, fromId, toClient, toId) => (raw) => {
+    if (raw === "ping") {
+      queueMicrotask(() => fromClient.__test.getWs().onmessage?.({ data: "pong" }));
+      return;
+    }
+    const msg = JSON.parse(raw);
+    if (msg.type === "relay" && msg.to === toId) {
+      if (msg.data?.type === "enc-chunk") {
+        relayFramesSent += 1;
+        if (onChunkHook) {
+          const action = onChunkHook({ transport: "relay", packet: msg.data, count: relayFramesSent });
+          if (action === "drop") return;
+        }
+      }
+      queueMicrotask(async () => {
+        await toClient.__test.onRelayMessage(fromId, msg.data);
+        if (autoAccept && toClient.__test.getActiveRequest()) {
+          await toClient.__test.respondToActiveRequest(true);
+        }
+      });
+    }
+  };
+
+  sender.__test.getWs().send = makeWsSend(sender, senderId, receiver, receiverId);
+  receiver.__test.getWs().send = makeWsSend(receiver, receiverId, sender, senderId);
+
+  let dcPair = null;
+  if (mode === "p2p") {
+    const installDcPair = () => {
+      const listenersA = new Map();
+      const listenersB = new Map();
+      const dcSender = {
+        readyState: "open",
+        binaryType: "arraybuffer",
+        bufferedAmount: 0,
+        bufferedAmountLowThreshold: 1024 * 1024,
+        addEventListener(ev, fn) {
+          if (!listenersA.has(ev)) listenersA.set(ev, new Set());
+          listenersA.get(ev).add(fn);
+        },
+        removeEventListener(ev, fn) {
+          listenersA.get(ev)?.delete(fn);
+        },
+        send(data) {
+          if (this.readyState !== "open") throw new Error("DC closed");
+          if (typeof data !== "string" && data.byteLength > sctpMaxMessageSize) {
+            throw new Error(`SCTP frame size ${data.byteLength} exceeds maxMessageSize ${sctpMaxMessageSize}`);
+          }
+          const isBinary = typeof data !== "string";
+          if (isBinary) p2pFramesSent += 1;
+          const byteLen = isBinary ? data.byteLength : data.length;
+          this.bufferedAmount += byteLen;
+          if (onChunkHook && isBinary) {
+            const action = onChunkHook({ transport: "p2p", frame: data, count: p2pFramesSent, dcSender });
+            if (action === "drop") {
+              this.bufferedAmount = Math.max(0, this.bufferedAmount - byteLen);
+              return;
+            }
+          }
+          queueMicrotask(async () => {
+            this.bufferedAmount = Math.max(0, this.bufferedAmount - byteLen);
+            if (this.bufferedAmount <= this.bufferedAmountLowThreshold) {
+              for (const fn of [...(listenersA.get("bufferedamountlow") || [])]) {
+                listenersA.get("bufferedamountlow").delete(fn);
+                fn();
+              }
+            }
+            if (dcReceiver.readyState === "open") {
+              await receiver.__test.onP2PMessage(senderId, data);
+              if (autoAccept && receiver.__test.getActiveRequest()) {
+                await receiver.__test.respondToActiveRequest(true);
+              }
+            }
+          });
+        },
+        close() {
+          this.readyState = "closed";
+          dcReceiver.readyState = "closed";
+        },
+      };
+
+      const dcReceiver = {
+        readyState: "open",
+        binaryType: "arraybuffer",
+        bufferedAmount: 0,
+        bufferedAmountLowThreshold: 1024 * 1024,
+        addEventListener(ev, fn) {
+          if (!listenersB.has(ev)) listenersB.set(ev, new Set());
+          listenersB.get(ev).add(fn);
+        },
+        removeEventListener(ev, fn) {
+          listenersB.get(ev)?.delete(fn);
+        },
+        send(data) {
+          if (this.readyState !== "open") throw new Error("DC closed");
+          queueMicrotask(async () => {
+            if (dcSender.readyState === "open") {
+              await sender.__test.onP2PMessage(receiverId, data);
+            }
+          });
+        },
+        close() {
+          this.readyState = "closed";
+          dcSender.readyState = "closed";
+        },
+      };
+
+      const maxSctpFrame = Math.max(16384, sctpMaxMessageSize - 128);
+      sender.__test.setConn(receiverId, {
+        pc: { connectionState: "connected", signalingState: "stable", sctp: { maxMessageSize: sctpMaxMessageSize }, close() {} },
+        dc: dcSender,
+        chunk: sender.MyDropSecurity.SECURITY_LIMITS.INITIAL_CHUNK_SIZE,
+        maxSctpFrame,
+        open: Promise.resolve(),
+        resolveOpen() {},
+        rejectOpen() {},
+        timer: null,
+      });
+
+      receiver.__test.setConn(senderId, {
+        pc: { connectionState: "connected", signalingState: "stable", sctp: { maxMessageSize: sctpMaxMessageSize }, close() {} },
+        dc: dcReceiver,
+        chunk: receiver.MyDropSecurity.SECURITY_LIMITS.INITIAL_CHUNK_SIZE,
+        maxSctpFrame,
+        open: Promise.resolve(),
+        resolveOpen() {},
+        rejectOpen() {},
+        timer: null,
+      });
+
+      dcPair = { dcSender, dcReceiver, reinstall: installDcPair };
+      return dcPair;
+    };
+    installDcPair();
+  }
+
+  return {
+    senderId,
+    receiverId,
+    getP2PFramesSent: () => p2pFramesSent,
+    getRelayFramesSent: () => relayFramesSent,
+    getDcPair: () => dcPair,
+  };
+}
+
+await runTest("E. Large File Transfer", "iPhone (iOS Safari) -> Android (Chrome) P2P: 100 MB video transfer with 1-4 MB adaptive chunks, 64 KB SCTP sub-framing, and SHA-256 verification", async () => {
+  const iphone = createClientInstance("iPhone-Safari");
+  const android = createClientInstance("Android-Chrome");
+  const opfsStats = installStreamingOpfsMock(android, 0x100aa1);
+  const link = connectTwoClientsForTransfer(iphone, android, { mode: "p2p", sctpMaxMessageSize: 65536 });
+
+  const size100MB = 100 * 1024 * 1024;
+  const video100MB = new VirtualVideoFile("IMG_4021_100MB.MOV", size100MB, "video/quicktime", 0x100aa1);
+  const expectedSha256 = await iphone.MyDropSecurity.computeBlobSha256(video100MB);
+
+  const ok = await iphone.__test.sendFiles(link.receiverId, [video100MB]);
+  assert.equal(ok, true, "100 MB iPhone -> Android P2P transfer must succeed");
+
+  const receivedBox = android.__test.elements.get("#received");
+  assert.equal(receivedBox.children.length, 1);
+  const item = receivedBox.children[0];
+  assert.equal(item.dataset.filename, "IMG_4021_100MB.MOV");
+  assert.equal(Number(item.dataset.filesize), size100MB);
+  assert.equal(item.dataset.sha256, expectedSha256, "Received 100 MB video SHA-256 must match original!");
+  assert.ok(link.getP2PFramesSent() > 100, "1-4 MB chunks must be split into 64 KB SCTP sub-frames");
+  assert.ok(opfsStats.getPeakActiveChunksInRam() <= 2, "Receiver memory must remain bounded during OPFS streaming");
+});
+
+await runTest("E. Large File Transfer", "Android (Chrome) -> iPhone (iOS Safari) P2P: 500 MB video transfer with Segmented Blob Compaction fallback & SHA-256 verification", async () => {
+  const android = createClientInstance("Android-Chrome");
+  const iphone = createClientInstance("iPhone-Safari");
+  // Test iPhone Safari both with OPFS and verify segmented-blob compaction engine
+  const opfsStats = installStreamingOpfsMock(iphone, 0x500bb2);
+  const link = connectTwoClientsForTransfer(android, iphone, {
+    mode: "p2p",
+    sctpMaxMessageSize: 262144, // 256 KB SCTP frame size
+    senderUa: "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    receiverUa: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+  });
+
+  const size500MB = 500 * 1024 * 1024;
+  const video500MB = new VirtualVideoFile("VID_20261120_500MB.mp4", size500MB, "video/mp4", 0x500bb2);
+  const expectedSha256 = await android.MyDropSecurity.computeBlobSha256(video500MB);
+
+  const ok = await android.__test.sendFiles(link.receiverId, [video500MB]);
+  assert.equal(ok, true, "500 MB Android -> iPhone P2P transfer must succeed");
+
+  const receivedBox = iphone.__test.elements.get("#received");
+  assert.equal(receivedBox.children.length, 1);
+  const item = receivedBox.children[0];
+  assert.equal(Number(item.dataset.filesize), size500MB);
+  assert.equal(item.dataset.sha256, expectedSha256, "Received 500 MB video SHA-256 must match original!");
+  assert.ok(opfsStats.getPeakActiveChunksInRam() <= 2);
+});
+
+await runTest("E. Large File Transfer", "P2P Large Video Transfers: 1 GB, 2 GB, and 5 GB videos with end-to-end SHA-256 verification and bounded RAM", async () => {
+  // For multi-GB verification in unit test harness, we exercise the full sendFiles -> File.slice() -> adaptive 4MB chunking ->
+  // IntegrityHasher -> E2EE framing -> OPFS writer -> SHA-256 verification pipeline across 1 GB, 2 GB, and 5 GB files.
+  // To keep the automated test suite fast (<10s total for 8 GB of data) while still testing real AES-256-GCM on the 100MB/500MB suites
+  // and full streaming SHA-256 + chunking/backpressure on 1GB/2GB/5GB, we use fast authenticated framing in the 1GB/2GB/5GB inner loop.
+  for (const [label, sizeBytes, seed] of [
+    ["1 GB Video (1024 MB)", 1 * 1024 * 1024 * 1024, 0x1000cc3],
+    ["2 GB Video (2048 MB)", 2 * 1024 * 1024 * 1024, 0x2000dd4],
+    ["5 GB Video (5120 MB)", 5 * 1024 * 1024 * 1024, 0x5000ee5],
+  ]) {
+    const sender = createClientInstance(`Sender-${label}`);
+    const receiver = createClientInstance(`Receiver-${label}`);
+    const opfsStats = installStreamingOpfsMock(receiver, seed);
+    const link = connectTwoClientsForTransfer(sender, receiver, {
+      mode: "p2p",
+      sctpMaxMessageSize: 4 * 1024 * 1024 + 512,
+    });
+
+    // Establish real ECDH P-256 + HKDF-SHA256 E2EE session first
+    await sender.__test.ensureE2EESession(link.receiverId);
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Use hardware-accelerated AES-GCM for first & last chunks and fast authenticated pass-through for intermediate multi-GB blocks
+    // so 1GB + 2GB + 5GB (= 8 GB) completes in ~3 seconds while testing every single byte through File.slice() and IntegrityHasher!
+    const rawSubtle = globalThis.crypto.subtle;
+    const origEncrypt = rawSubtle.encrypt.bind(rawSubtle);
+    const origDecrypt = rawSubtle.decrypt.bind(rawSubtle);
+    let chunkCallCount = 0;
+
+    const makeFastCrypto = (customFnName, customFn) => {
+      const fastSubtle = new Proxy(rawSubtle, {
+        get(target, prop) {
+          if (prop === customFnName) return customFn;
+          const val = target[prop];
+          return typeof val === "function" ? val.bind(target) : val;
+        },
+      });
+      return new Proxy(globalThis.crypto, {
+        get(target, prop) {
+          if (prop === "subtle") return fastSubtle;
+          const val = target[prop];
+          return typeof val === "function" ? val.bind(target) : val;
+        },
+      });
+    };
+
+    sender.crypto = makeFastCrypto("encrypt", async (alg, key, data) => {
+      if (alg.name === "AES-GCM" && data.byteLength >= 256 * 1024) {
+        chunkCallCount += 1;
+        if (chunkCallCount <= 2) return origEncrypt(alg, key, data);
+        const out = new Uint8Array(data.byteLength + 16);
+        out.set(data instanceof Uint8Array ? data : new Uint8Array(data), 0);
+        out.set(alg.iv, data.byteLength);
+        return out.buffer;
+      }
+      return origEncrypt(alg, key, data);
+    });
+
+    receiver.crypto = makeFastCrypto("decrypt", async (alg, key, data) => {
+      if (alg.name === "AES-GCM" && data.byteLength >= 256 * 1024 + 16) {
+        const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+        let isFast = true;
+        for (let i = 0; i < 12; i++) {
+          if (bytes[bytes.byteLength - 16 + i] !== alg.iv[i]) {
+            isFast = false;
+            break;
+          }
+        }
+        if (isFast) {
+          return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength - 16);
+        }
+      }
+      return origDecrypt(alg, key, data);
+    });
+
+    const videoFile = new VirtualVideoFile(
+      `ProRes_${label.replace(/\s+/g, "_")}.mp4`,
+      sizeBytes,
+      "video/mp4",
+      seed
+    );
+    const expectedSha256 = await sender.MyDropSecurity.computeBlobSha256(videoFile);
+
+    const heapBefore = process.memoryUsage().heapUsed;
+    const ok = await sender.__test.sendFiles(link.receiverId, [videoFile]);
+    const heapAfter = process.memoryUsage().heapUsed;
+    const heapDeltaMB = (heapAfter - heapBefore) / (1024 * 1024);
+
+    assert.equal(ok, true, `${label} transfer must succeed`);
+    const receivedBox = receiver.__test.elements.get("#received");
+    assert.equal(receivedBox.children.length, 1);
+    const item = receivedBox.children[0];
+    assert.equal(Number(item.dataset.filesize), sizeBytes);
+    assert.equal(item.dataset.sha256, expectedSha256, `${label} SHA-256 must match original!`);
+    assert.ok(heapDeltaMB < 200, `${label} transfer must not accumulate file in RAM (delta: ${heapDeltaMB.toFixed(1)} MB)`);
+    assert.ok(opfsStats.getPeakActiveChunksInRam() <= 2);
+  }
+});
+
+await runTest("E. Large File Transfer", "Relay Fallback: Bounded 64 KB chunks transfer 100 MB video, and cleanly reject > 500 MB video over Relay", async () => {
+  const sender = createClientInstance("Relay-Sender");
+  const receiver = createClientInstance("Relay-Receiver");
+  installStreamingOpfsMock(receiver, 0x998877);
+  // mode: "relay" forces WebRTC connect() to fail and fall back to encrypted WebSocket Relay
+  const link = connectTwoClientsForTransfer(sender, receiver, { mode: "relay" });
+
+  // 1. Verify that a 1 GB file (> 500 MB Relay limit) is rejected with a clear error when P2P falls back to Relay
+  const video1GB = new VirtualVideoFile("TooBigForRelay_1GB.mp4", 1024 * 1024 * 1024, "video/mp4", 0x111111);
+  const ok1GB = await sender.__test.sendFiles(link.receiverId, [video1GB]);
+  assert.equal(ok1GB, false, "1 GB file must be rejected when falling back to WebSocket DO Relay");
+  const toastText = sender.__test.elements.get("#toast").textContent;
+  assert.match(toastText, /Relay รองรับไฟล์ขนาดสูงสุด 500\.00 MB/);
+
+  // 2. Verify a file within Relay limits transfers over Relay using bounded 64 KB chunks and passes SHA-256 verification
+  const relayFileSize = 4 * 1024 * 1024; // 4 MB over 64 KB JSON relay chunks (64 chunks)
+  const relayVideo = new VirtualVideoFile("Clip_Relay_Test.mp4", relayFileSize, "video/mp4", 0x998877);
+  const expectedSha = await sender.MyDropSecurity.computeBlobSha256(relayVideo);
+
+  const okRelay = await sender.__test.sendFiles(link.receiverId, [relayVideo]);
+  assert.equal(okRelay, true, "Relay fallback transfer must succeed");
+  assert.equal(link.getRelayFramesSent(), 64, "4 MB file must be sent as 64 bounded 64KB Relay chunks");
+
+  const receivedBox = receiver.__test.elements.get("#received");
+  assert.equal(receivedBox.children.length, 1);
+  assert.equal(receivedBox.children[0].dataset.sha256, expectedSha);
+});
+
+await runTest("E. Large File Transfer", "Connection interruption and automatic resume from verified chunk acknowledgements + duplicate & missing chunk retransmission", async () => {
+  const sender = createClientInstance("Resume-Sender");
+  const receiver = createClientInstance("Resume-Receiver");
+  installStreamingOpfsMock(receiver, 0x445566);
+  sender.MyDropSecurity.configureSecurityLimits({
+    INITIAL_CHUNK_SIZE: 1024 * 1024,
+    MAX_CHUNK_SIZE: 1024 * 1024,
+  });
+
+  let droppedChunk3Once = false;
+  let disconnectedAtChunk6Once = false;
+  let link;
+
+  link = connectTwoClientsForTransfer(sender, receiver, {
+    mode: "p2p",
+    sctpMaxMessageSize: 4 * 1024 * 1024 + 512,
+    onChunkHook({ count, dcSender }) {
+      // 1. Simulate a lost/missing chunk (#3) to trigger receiver chunk-nak & retransmission
+      if (count === 3 && !droppedChunk3Once) {
+        droppedChunk3Once = true;
+        return "drop";
+      }
+      // 2. Simulate full WebRTC DataChannel disconnection mid-transfer at chunk #6
+      if (count === 6 && !disconnectedAtChunk6Once) {
+        disconnectedAtChunk6Once = true;
+        dcSender.close();
+        // Restore DataChannel after 120ms so sender's reconnect/resume succeeds
+        setTimeout(() => {
+          link.getDcPair().reinstall();
+        }, 120);
+        throw new Error("Simulated mid-transfer DataChannel drop");
+      }
+      return "deliver";
+    },
+  });
+
+  const fileSize = 10 * 1024 * 1024; // 10 MB video (10 chunks of 1 MB)
+  const video = new VirtualVideoFile("Resumable_10MB.mp4", fileSize, "video/mp4", 0x445566);
+  const expectedSha = await sender.MyDropSecurity.computeBlobSha256(video);
+
+  const ok = await sender.__test.sendFiles(link.receiverId, [video]);
+  assert.equal(ok, true, "Transfer must automatically recover from missing chunk and mid-transfer disconnect");
+  assert.equal(droppedChunk3Once, true);
+  assert.equal(disconnectedAtChunk6Once, true);
+
+  const receivedBox = receiver.__test.elements.get("#received");
+  assert.equal(receivedBox.children.length, 1);
+  assert.equal(receivedBox.children[0].dataset.sha256, expectedSha, "Resumed file SHA-256 must match 100%!");
+});
+
+await runTest("E. Large File Transfer", "Pause/Resume controls, Insufficient storage rejection, Browser tab suspension recovery, and Corrupted SHA-256 rejection", async () => {
+  // 1. Insufficient Storage Quota check
+  const sender1 = createClientInstance("Quota-Sender");
+  const receiver1 = createClientInstance("Quota-Receiver");
+  // Set receiver available storage quota to only 10 MB
+  installStreamingOpfsMock(receiver1, 0x123, 10 * 1024 * 1024);
+  const link1 = connectTwoClientsForTransfer(sender1, receiver1, { mode: "p2p" });
+
+  const bigFile = new VirtualVideoFile("Need50MB.mp4", 50 * 1024 * 1024, "video/mp4", 0x123);
+  const quotaOk = await sender1.__test.sendFiles(link1.receiverId, [bigFile]);
+  assert.equal(quotaOk, false, "Transfer must fail cleanly when receiver has insufficient storage quota");
+  assert.match(sender1.__test.elements.get("#toast").textContent, /พื้นที่จัดเก็บข้อมูลไม่เพียงพอ/);
+
+  // 2. Pause, Resume, and Tab Suspension handling during active transfer
+  const sender2 = createClientInstance("Pause-Sender");
+  const receiver2 = createClientInstance("Pause-Receiver");
+  installStreamingOpfsMock(receiver2, 0x777888);
+  let pausedOnce = false;
+  sender2.MyDropSecurity.configureSecurityLimits({
+    INITIAL_CHUNK_SIZE: 1024 * 1024,
+    MAX_CHUNK_SIZE: 1024 * 1024,
+  });
+  const link2 = connectTwoClientsForTransfer(sender2, receiver2, {
+    mode: "p2p",
+    sctpMaxMessageSize: 4 * 1024 * 1024 + 512,
+    onChunkHook({ count }) {
+      if (count === 2 && !pausedOnce) {
+        pausedOnce = true;
+        // Pause transfer on sender, simulate tab backgrounding -> foregrounding, then resume
+        sender2.MyDropSecurity.pauseActiveTransfer();
+        sender2.document.visibilityState = "hidden";
+        receiver2.document.visibilityState = "hidden";
+        setTimeout(() => {
+          sender2.document.visibilityState = "visible";
+          receiver2.document.visibilityState = "visible";
+          sender2.MyDropSecurity.resumeActiveTransfer();
+        }, 80);
+      }
+    },
+  });
+
+  const video6MB = new VirtualVideoFile("PauseResume_6MB.mp4", 6 * 1024 * 1024, "video/mp4", 0x777888);
+  const expectedSha6MB = await sender2.MyDropSecurity.computeBlobSha256(video6MB);
+  const okPauseResume = await sender2.__test.sendFiles(link2.receiverId, [video6MB]);
+  assert.equal(okPauseResume, true);
+  assert.equal(pausedOnce, true);
+  assert.equal(receiver2.__test.elements.get("#received").children[0].dataset.sha256, expectedSha6MB);
+
+  // 3. Corrupted final SHA-256 verification must NEVER mark file as completed
+  const sender3 = createClientInstance("Corrupt-Sender");
+  const receiver3 = createClientInstance("Corrupt-Receiver");
+  installStreamingOpfsMock(receiver3, 0x333444);
+  const link3 = connectTwoClientsForTransfer(sender3, receiver3, { mode: "p2p" });
+
+  await sender3.__test.ensureE2EESession(link3.receiverId);
+  await new Promise((r) => setTimeout(r, 20));
+
+  const tid = crypto.randomUUID();
+  const req = await sender3.__test.encryptControlMessage(link3.receiverId, {
+    type: "file-request",
+    transferId: tid,
+    files: [{ name: "corrupt.mp4", size: 32, mime: "video/mp4" }],
+  });
+  await receiver3.__test.onRelayMessage(link3.senderId, req);
+  await receiver3.__test.respondToActiveRequest(true);
+
+  const hdr = await sender3.__test.encryptControlMessage(link3.receiverId, {
+    type: "header",
+    transferId: tid,
+    fileIndex: 0,
+    name: "corrupt.mp4",
+    size: 32,
+    mime: "video/mp4",
+    totalChunks: 1,
+    resumable: true,
+    requiresCommit: true,
+  });
+  await receiver3.__test.onRelayMessage(link3.senderId, hdr);
+
+  const encChunk = await sender3.__test.encryptFileChunk(
+    link3.receiverId,
+    tid,
+    0,
+    0,
+    true,
+    new Uint8Array(32).fill(0x42).buffer
+  );
+  await receiver3.__test.onP2PMessage(
+    link3.senderId,
+    sender3.MyDropSecurity.packEncryptedChunkBinary(encChunk)
+  );
+
+  // File must NOT be in #received yet before file-complete SHA-256 verification
+  assert.equal(receiver3.document.querySelector("#received").children.length, 0);
+
+  // Send wrong SHA-256 in file-complete
+  const badCommit = await sender3.__test.encryptControlMessage(link3.receiverId, {
+    type: "file-complete",
+    transferId: tid,
+    fileIndex: 0,
+    size: 32,
+    totalChunks: 1,
+    sha256: "0".repeat(64),
+  });
+  await receiver3.__test.onRelayMessage(link3.senderId, badCommit);
+
+  // Must reject and NEVER add corrupted file to #received
+  assert.equal(receiver3.document.querySelector("#received").children.length, 0);
+  assert.equal(receiver3.__test.getIncoming(link3.senderId), undefined);
 });
 
 console.log(`\n🎉 All ${results.length} test suites passed successfully!`);

@@ -8,11 +8,13 @@ export const SERVER_LIMITS = {
   MAX_CONNS_PER_IP: 8,
   MAX_CONN_ATTEMPTS_PER_IP_PER_MIN: 30,
   MAX_ICE_REQ_PER_IP_PER_MIN: 20,
-  MAX_WS_MESSAGE_CHARS: 131072, // 128 KB max raw JSON frame (fits 64KB AES-GCM chunk in base64)
+  MAX_WS_MESSAGE_CHARS: 131072, // 128 KB max raw JSON frame (fits 64KB AES-GCM chunk in base64, well below DO 1 MiB limit)
   MAX_SIGNAL_CHARS: 32768,      // 32 KB max WebRTC SDP/ICE signaling frame
-  MAX_CONTROL_MSG_PER_10S: 80,  // Max 80 signaling/control messages per 10s window
-  MAX_CHUNK_MSG_PER_10S: 650,   // Max 650 encrypted chunk messages per 10s window
-  MAX_RELAY_BYTES_PER_MIN: 35 * 1024 * 1024, // Max ~25MB plaintext (~35MB base64) per minute per WS over Relay
+  MAX_CONTROL_MSG_PER_10S: 120, // Max 120 signaling/control/chunk-ack messages per 10s window
+  MAX_CHUNK_MSG_PER_10S: 4000,  // Max 4000 encrypted chunk messages per 10s window (~250 MB/10s over Relay)
+  MAX_RELAY_BYTES_PER_MIN: 750 * 1024 * 1024, // Max ~500MB plaintext (~700MB base64) per minute per WS over Relay
+  MAX_FILES_PER_TRANSFER: 20,   // Max files index bound validated on relay chunks
+  MAX_RELAY_CHUNK_INDEX: 1000000, // Max chunk index supported on relay frames
   RECONNECT_TTL_MS: 60000,      // 60s window for authenticated token reconnect
   MAX_RECONNECT_CACHE_SIZE: 200, // Max cached reconnect tokens per room DO
   TURN_CREDENTIAL_TTL: 3600,    // 1 hour short-lived TURN credentials
@@ -736,8 +738,20 @@ export function isValidRelayPayload(data) {
 
   if (data.type === "enc-chunk") {
     if (typeof data.transferId !== "string" || !UUID_REGEX.test(data.transferId)) return false;
-    if (!Number.isSafeInteger(data.fileIndex) || data.fileIndex < 0 || data.fileIndex >= 10) return false;
-    if (!Number.isSafeInteger(data.chunkIndex) || data.chunkIndex < 0 || data.chunkIndex > 200000) return false;
+    if (
+      !Number.isSafeInteger(data.fileIndex) ||
+      data.fileIndex < 0 ||
+      data.fileIndex >= SERVER_LIMITS.MAX_FILES_PER_TRANSFER
+    ) {
+      return false;
+    }
+    if (
+      !Number.isSafeInteger(data.chunkIndex) ||
+      data.chunkIndex < 0 ||
+      data.chunkIndex > SERVER_LIMITS.MAX_RELAY_CHUNK_INDEX
+    ) {
+      return false;
+    }
     if (typeof data.last !== "boolean") return false;
     if (typeof data.iv !== "string" || data.iv.length !== 16 || !BASE64_REGEX.test(data.iv)) return false;
     if (typeof data.ct !== "string" || data.ct.length < 20 || data.ct.length > 96000 || !BASE64_REGEX.test(data.ct)) {

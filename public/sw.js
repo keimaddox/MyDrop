@@ -1,4 +1,4 @@
-const CACHE_NAME = "mydrop-v5";
+const CACHE_NAME = "mydrop-v6";
 const ASSETS = [
   "/",
   "/index.html",
@@ -10,8 +10,8 @@ const ASSETS = [
 
 const SHARE_LIMITS = {
   MAX_FILES: 10,
-  MAX_FILE_SIZE: 50 * 1024 * 1024,
-  MAX_TOTAL_SIZE: 100 * 1024 * 1024,
+  MAX_FILE_SIZE: 5 * 1024 * 1024 * 1024, // 5 GB per file
+  MAX_TOTAL_SIZE: 10 * 1024 * 1024 * 1024, // 10 GB total
   MAX_TEXT_CHARS: 16384,
   MAX_FILENAME_LENGTH: 255,
 };
