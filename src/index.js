@@ -1,9 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_ROOM_CONNECTIONS = 12;
-const MAX_WS_MESSAGE_BYTES = 64 * 1024;
+const MAX_WS_MESSAGE_BYTES = 128 * 1024;
 const MAX_SIGNAL_BYTES = 32 * 1024;
-const MAX_RELAY_BYTES = 48 * 1024;
+const MAX_RELAY_BYTES = 112 * 1024;
 const MAX_MESSAGES_PER_SECOND = 40;
 const ROOM_CODE_RE = /^[a-zA-Z0-9_-]{3,48}$/;
 
@@ -78,9 +78,7 @@ function securityHeaders(response) {
   headers.set("Cross-Origin-Resource-Policy", "same-origin");
   headers.set("Content-Security-Policy",
     "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https: wss: stun: turn:; media-src 'self' blob:; upgrade-insecure-requests");
-  if (new URL(response.url || "https://mydrop.invalid").protocol === "https:") {
-    headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
-  }
+  headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
