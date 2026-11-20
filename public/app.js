@@ -677,8 +677,11 @@ async function sendPendingShare(peerId) {
 // ================= รับข้อมูล & ยอมรับ/ปฏิเสธ =================
 function onData(peerId, data) {
   if (typeof data === "string") {
-    const msg = JSON.parse(data);
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+    if (!msg || typeof msg.type !== "string") return;
     if (msg.type === "text") {
+      if (typeof msg.text !== "string" || msg.text.length > MAX_TEXT_LENGTH) return;
       addReceivedText(peerName(peerId), msg.text);
     } else if (msg.type === "file-request") {
       if (typeof msg.transferId !== "string" || msg.transferId.length > 80 ||
@@ -696,6 +699,7 @@ function onData(peerId, data) {
       requestQueue.push({ peerId, transferId: msg.transferId, files: msg.files });
       processRequestQueue();
     } else if (msg.type === "file-response") {
+      if (typeof msg.transferId !== "string" || typeof msg.accepted !== "boolean") return;
       const pending = pendingResponses.get(msg.transferId);
       if (pending) {
         pendingResponses.delete(msg.transferId);
