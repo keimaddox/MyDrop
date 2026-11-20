@@ -1,29 +1,39 @@
 import { DurableObject } from "cloudflare:workers";
 
-// ---------- Worker หลัก ----------
+const MAX_ROOM_CONNECTIONS = 12;
+const MAX_WS_MESSAGE_BYTES = 128 * 1024;
+const MAX_SIGNAL_BYTES = 32 * 1024;
+const MAX_RELAY_BYTES = 112 * 1024;
+const MAX_MESSAGES_PER_SECOND = 40;
+const ROOM_CODE_RE = /^[a-zA-Z0-9_-]{3,48}$/;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/ws") {
-      if (request.headers.get("Upgrade") !== "websocket") {
+      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         return new Response("Expected WebSocket", { status: 426 });
       }
-      // ใช้ room code ถ้ามี (?room=xxx) ไม่งั้นจัดห้องตาม Public IP
-      const code = url.searchParams.get("room");
-      const ip = request.headers.get("CF-Connecting-IP") || "local";
-      const roomKey = code ? "code:" + code.toLowerCase() : roomFromIp(ip);
 
+      const code = url.searchParams.get("room");
+      if (code && !ROOM_CODE_RE.test(code)) {
+        return new Response("Invalid room code", { status: 400 });
+      }
+
+      // Public rooms remain open; room codes are grouping keys, not passwords.
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const roomKey = code ? "code:" + code.toLowerCase() : roomFromIp(ip);
       const stub = env.ROOMS.get(env.ROOMS.idFromName(roomKey));
       return stub.fetch(request);
     }
 
-    // คืนค่า ICE servers (ใช้ Cloudflare TURN อัตโนมัติถ้าตั้งค่า TURN_TOKEN_ID / TURN_API_TOKEN ไว้)
     if (url.pathname === "/ice") {
       const iceServers = [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
       ];
+
       if (env.TURN_TOKEN_ID && env.TURN_API_TOKEN) {
         try {
           const res = await fetch(
@@ -34,32 +44,49 @@ export default {
                 Authorization: `Bearer ${env.TURN_API_TOKEN}`,
                 "Content-Type": "application/json",
               },
-              body: JSON.stringify({ ttl: 86400 }),
+              body: JSON.stringify({ ttl: 3600 }),
             }
           );
           if (res.ok) {
             const data = await res.json();
             if (data.iceServers) {
               const turn = Array.isArray(data.iceServers) ? data.iceServers : [data.iceServers];
-              return Response.json({ iceServers: [...iceServers, ...turn] });
+              return securityHeaders(Response.json({ iceServers: [...iceServers, ...turn] }));
             }
           }
-        } catch {}
+        } catch {
+          // STUN remains available if TURN credential generation is temporarily unavailable.
+        }
       }
-      return Response.json({ iceServers });
+      return securityHeaders(Response.json({ iceServers }));
     }
 
-    // Fallback กรณี Share Target POST มาถึง Worker โดยตรงก่อน SW ทำงาน
     if (url.pathname === "/share-target" && request.method === "POST") {
-      return Response.redirect(new URL("/", url).toString(), 303);
+      return securityHeaders(Response.redirect(new URL("/", url).toString(), 303));
     }
 
-    return env.ASSETS.fetch(request);
+    return securityHeaders(await env.ASSETS.fetch(request));
   },
 };
 
-// IPv4 ใช้ทั้ง IP / IPv6 ใช้แค่ /64 prefix
-// (มือถือแต่ละเครื่องใน Wi-Fi เดียวกันได้ IPv6 คนละตัว แต่ prefix เดียวกัน)
+function securityHeaders(response) {
+  const headers = new Headers(response.headers);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  headers.set("Cross-Origin-Resource-Policy", "same-origin");
+  headers.set("Content-Security-Policy",
+    "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https: wss: stun: turn:; media-src 'self' blob:; upgrade-insecure-requests");
+  headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+// IPv4 is grouped by address; IPv6 is grouped by /64.
 function roomFromIp(ip) {
   if (!ip.includes(":")) return "v4:" + ip;
   const [head, tail = ""] = ip.split("::");
@@ -69,61 +96,90 @@ function roomFromIp(ip) {
   return "v6:" + full.slice(0, 4).join(":");
 }
 
-// ---------- Durable Object: 1 ตัว = 1 ห้อง ----------
 export class Room extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    // ตอบ ping อัตโนมัติ โดยไม่ต้องปลุก DO (ประหยัดโควตา)
     this.ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair("ping", "pong")
     );
   }
 
   async fetch(request) {
-    const url = new URL(request.url);
-    const reqId = url.searchParams.get("id");
-    const reqName = url.searchParams.get("name");
-    const { 0: client, 1: server } = new WebSocketPair();
-    const me = {
-      id: reqId || crypto.randomUUID(),
-      name: reqName || randomName(),
-      device: detectDevice(request.headers.get("User-Agent") || ""),
-    };
-
-    // ปิด socket เดิมที่ค้างอยู่หากอุปกรณ์เดิมเชื่อมต่อเข้ามาใหม่
-    for (const old of this.ctx.getWebSockets()) {
-      if (old.deserializeAttachment()?.id === me.id) {
-        old.serializeAttachment({ id: null });
-        try { old.close(1000, "replaced"); } catch {}
-      }
+    const active = this.ctx.getWebSockets().filter((s) => s.deserializeAttachment()?.id);
+    if (active.length >= MAX_ROOM_CONNECTIONS) {
+      return new Response("Room is full", { status: 429 });
     }
 
-    this.ctx.acceptWebSocket(server); // Hibernation API
+    const { 0: client, 1: server } = new WebSocketPair();
+    // Never trust client-provided IDs or display names.
+    const me = {
+      id: crypto.randomUUID(),
+      name: randomName(),
+      device: detectDevice(request.headers.get("User-Agent") || ""),
+      rateWindow: Math.floor(Date.now() / 1000),
+      rateCount: 0,
+    };
+
+    this.ctx.acceptWebSocket(server);
     server.serializeAttachment(me);
-    server.send(JSON.stringify({ type: "welcome", ...me }));
+    server.send(JSON.stringify({ type: "welcome", id: me.id, name: me.name, device: me.device }));
     this.broadcastPeers();
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws, raw) {
-    if (typeof raw !== "string") return;
+    if (raw === "ping") return;
+    if (typeof raw !== "string" || raw.length > MAX_WS_MESSAGE_BYTES) {
+      try { ws.close(1009, "message too large"); } catch {}
+      return;
+    }
+
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-    if ((msg.type !== "signal" && msg.type !== "relay") || !msg.to) return;
+    if (!msg || (msg.type !== "signal" && msg.type !== "relay")) return;
+    if (typeof msg.to !== "string" || !/^[0-9a-f-]{36}$/i.test(msg.to)) return;
 
     const from = ws.deserializeAttachment();
-    if (!from?.id) return;
+    if (!from?.id || msg.to === from.id) return;
+
+    const now = Math.floor(Date.now() / 1000);
+    const current = ws.deserializeAttachment();
+    if (current.rateWindow !== now) {
+      current.rateWindow = now;
+      current.rateCount = 0;
+    }
+    current.rateCount += 1;
+    ws.serializeAttachment(current);
+    if (current.rateCount > MAX_MESSAGES_PER_SECOND) {
+      try { ws.close(1008, "rate limit"); } catch {}
+      return;
+    }
+
+    let dataBytes;
+    try { dataBytes = new TextEncoder().encode(JSON.stringify(msg.data)).byteLength; } catch { return; }
+    const limit = msg.type === "signal" ? MAX_SIGNAL_BYTES : MAX_RELAY_BYTES;
+    if (!msg.data || dataBytes > limit) return;
+
+    if (msg.type === "signal") {
+      if (!["offer", "answer", "ice"].includes(msg.data.type)) return;
+      if (msg.data.type === "ice" && !msg.data.candidate) return;
+      if (["offer", "answer"].includes(msg.data.type) && !msg.data.description && !msg.data.sdp) return;
+    } else {
+      if (typeof msg.data.type !== "string" ||
+          !["chunk", "text", "file-request", "file-response", "header"].includes(msg.data.type)) return;
+    }
+
     for (const peer of this.ctx.getWebSockets()) {
-      if (peer.deserializeAttachment()?.id === msg.to) {
-        try {
-          peer.send(JSON.stringify({ type: msg.type, from: from.id, data: msg.data }));
-        } catch {
-          try { peer.close(1011, "dead"); } catch {}
-          this.broadcastPeers(peer);
-        }
-        break;
+      const peerInfo = peer.deserializeAttachment();
+      if (peerInfo?.id !== msg.to) continue;
+      try {
+        peer.send(JSON.stringify({ type: msg.type, from: from.id, data: msg.data }));
+      } catch {
+        try { peer.close(1011, "send failed"); } catch {}
+        this.broadcastPeers(peer);
       }
+      break;
     }
   }
 
@@ -137,20 +193,16 @@ export class Room extends DurableObject {
   }
 
   broadcastPeers(exclude) {
-    const sockets = this.ctx
-      .getWebSockets()
+    const sockets = this.ctx.getWebSockets()
       .filter((s) => s !== exclude && s.deserializeAttachment()?.id);
-    const byId = new Map();
-    for (const s of sockets) {
-      const info = s.deserializeAttachment();
-      if (info?.id) byId.set(info.id, info);
-    }
-    const all = [...byId.values()];
-
+    const all = sockets.map((s) => s.deserializeAttachment());
     for (const s of sockets) {
       const me = s.deserializeAttachment();
       try {
-        s.send(JSON.stringify({ type: "peers", peers: all.filter((p) => p.id !== me.id) }));
+        s.send(JSON.stringify({
+          type: "peers",
+          peers: all.filter((p) => p.id !== me.id).map(({ id, name, device }) => ({ id, name, device })),
+        }));
       } catch {}
     }
   }

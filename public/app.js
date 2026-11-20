@@ -10,6 +10,10 @@ const iceReady = fetch("/ice")
   .catch(() => {});
 
 const MAX_BUFFER = 8 * 1024 * 1024; // คิวค้างส่งได้ไม่เกิน 8MB
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
+const MAX_TRANSFER_SIZE = 100 * 1024 * 1024;
+const MAX_FILES_PER_TRANSFER = 10;
+const MAX_TEXT_LENGTH = 16 * 1024;
 const ICONS = { phone: "📱", tablet: "📱", desktop: "💻" };
 
 const $ = (s) => document.querySelector(s);
@@ -202,8 +206,6 @@ function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const params = new URLSearchParams();
   if (currentRoom) params.set("room", currentRoom);
-  if (myId) params.set("id", myId);
-  if (myName) params.set("name", myName);
   const qs = params.toString();
   const socket = new WebSocket(`${proto}://${location.host}/ws${qs ? "?" + qs : ""}`);
   ws = socket;
@@ -644,6 +646,10 @@ async function sendFiles(peerId, files) {
 async function sendText(peerId, presetText = null) {
   const text = presetText ?? prompt("พิมพ์ข้อความ:");
   if (!text) return false;
+  if (typeof text !== "string" || text.length > MAX_TEXT_LENGTH) {
+    toast("ข้อความยาวเกินกำหนด (สูงสุด 16 KB)");
+    return false;
+  }
   try {
     const tx = await getTransport(peerId);
     tx.sendControl({ type: "text", text });
@@ -671,22 +677,39 @@ async function sendPendingShare(peerId) {
 // ================= รับข้อมูล & ยอมรับ/ปฏิเสธ =================
 function onData(peerId, data) {
   if (typeof data === "string") {
-    const msg = JSON.parse(data);
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+    if (!msg || typeof msg.type !== "string") return;
     if (msg.type === "text") {
+      if (typeof msg.text !== "string" || msg.text.length > MAX_TEXT_LENGTH) return;
       addReceivedText(peerName(peerId), msg.text);
     } else if (msg.type === "file-request") {
-      if (seenRequests.has(msg.transferId)) return;
+      if (typeof msg.transferId !== "string" || msg.transferId.length > 80 ||
+          !Array.isArray(msg.files) || msg.files.length < 1 ||
+          msg.files.length > MAX_FILES_PER_TRANSFER || seenRequests.has(msg.transferId)) return;
+      const validFiles = msg.files.every((f) =>
+        f && typeof f.name === "string" && f.name.length > 0 && f.name.length <= 255 &&
+        Number.isSafeInteger(f.size) && f.size >= 0 && f.size <= MAX_FILE_SIZE
+      );
+      const total = msg.files.reduce((sum, f) => sum + (Number.isSafeInteger(f?.size) ? f.size : 0), 0);
+      if (!validFiles || total > MAX_TRANSFER_SIZE) return;
+      if (requestQueue.length >= 5) return;
       seenRequests.add(msg.transferId);
-      requestQueue.push({ peerId, transferId: msg.transferId, files: msg.files || [] });
+      if (seenRequests.size > 200) seenRequests.delete(seenRequests.values().next().value);
+      requestQueue.push({ peerId, transferId: msg.transferId, files: msg.files });
       processRequestQueue();
     } else if (msg.type === "file-response") {
+      if (typeof msg.transferId !== "string" || typeof msg.accepted !== "boolean") return;
       const pending = pendingResponses.get(msg.transferId);
       if (pending) {
         pendingResponses.delete(msg.transferId);
         pending.resolve(Boolean(msg.accepted));
       }
     } else if (msg.type === "header") {
-      if (!acceptedTransfers.has(msg.transferId)) return;
+      if (!acceptedTransfers.has(msg.transferId) || typeof msg.name !== "string" ||
+          msg.name.length < 1 || msg.name.length > 255 ||
+          !Number.isSafeInteger(msg.size) || msg.size < 0 || msg.size > MAX_FILE_SIZE ||
+          incoming.has(peerId)) return;
       incoming.set(peerId, { meta: msg, chunks: [], received: 0 });
       if (msg.size === 0) finishFile(peerId);
     }
@@ -694,11 +717,15 @@ function onData(peerId, data) {
   }
 
   const f = incoming.get(peerId);
-  if (!f) return;
+  if (!f || !(data instanceof ArrayBuffer) || data.byteLength === 0 ||
+      f.received + data.byteLength > f.meta.size || f.received + data.byteLength > MAX_FILE_SIZE) {
+    if (f) incoming.delete(peerId);
+    return;
+  }
   f.chunks.push(data);
   f.received += data.byteLength;
   setProgress(peerId, f.received / f.meta.size, `รับ ${f.meta.name}`);
-  if (f.received >= f.meta.size) finishFile(peerId);
+  if (f.received === f.meta.size) finishFile(peerId);
 }
 
 function formatSize(bytes) {
@@ -761,7 +788,11 @@ $("#rejectBtn").onclick = () => respondToActiveRequest(false);
 function finishFile(peerId) {
   const f = incoming.get(peerId);
   incoming.delete(peerId);
-  const blob = new Blob(f.chunks, { type: f.meta.mime || "application/octet-stream" });
+  if (!f || f.received !== f.meta.size) return;
+  acceptedTransfers.delete(f.meta.transferId);
+  const safeMime = typeof f.meta.mime === "string" && /^[\w.+-]+\/[\w.+-]+$/.test(f.meta.mime)
+    ? f.meta.mime : "application/octet-stream";
+  const blob = new Blob(f.chunks, { type: safeMime });
   addReceivedFile(peerName(peerId), f.meta.name, blob);
   setProgress(peerId, null);
   toast(`ได้รับ ${f.meta.name}`);
