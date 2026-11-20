@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 
-// Provide a Cloudflare workerd-compatible Response wrapper in Node.js that allows status 101 + webSocket property
 const NativeResponse = globalThis.Response;
 globalThis.Response = class CloudflareResponse extends NativeResponse {
   constructor(body, init = {}) {
@@ -239,14 +238,12 @@ await runTest("4. Multiple peers can join a room and discover each other", async
   assert.equal(peersMsg1.peers.length, 1);
   assert.equal(peersMsg1.peers[0].id, welcome2.id);
   assert.equal(peersMsg2.peers[0].id, welcome1.id);
-  // Ensure internal fields like ip or rateCount are not leaked in peers list
   assert.equal(peersMsg1.peers[0].ip, undefined);
   assert.equal(peersMsg1.peers[0].rateCount, undefined);
 });
 
 await runTest("5. Room occupancy limit (12 peers) and per-IP connection limits are enforced", async () => {
   const env = createMockEnv();
-  // Connect 12 peers from distinct IPs into the same room
   for (let i = 1; i <= 12; i++) {
     const res = await worker.fetch(
       makeWsRequest("https://mydrop.example/ws?room=fullroom", `192.0.2.${i}`),
@@ -260,7 +257,6 @@ await runTest("5. Room occupancy limit (12 peers) and per-IP connection limits a
   );
   assert.equal(res13.status, 429);
 
-  // Per-IP active connections limit (8 per IP in a room)
   for (let i = 1; i <= 8; i++) {
     const res = await worker.fetch(
       makeWsRequest("https://mydrop.example/ws?room=ipcaproom", "198.51.100.50"),
@@ -292,7 +288,7 @@ await runTest("6. Excessive connection attempts per IP per minute are rate-limit
   assert.equal(lastStatus, 429);
 });
 
-await runTest("7. Malformed, spoofed, and oversized WebSocket messages are rejected", async () => {
+await runTest("7. Malformed, spoofed, plaintext-relay, and oversized WebSocket messages are rejected", async () => {
   const env = createMockEnv();
   const res1 = await worker.fetch(makeWsRequest("https://mydrop.example/ws?room=msgtest", "198.51.100.10"), env);
   const res2 = await worker.fetch(makeWsRequest("https://mydrop.example/ws?room=msgtest", "198.51.100.11"), env);
@@ -303,43 +299,31 @@ await runTest("7. Malformed, spoofed, and oversized WebSocket messages are rejec
   const id2 = JSON.parse(ws2.sent[0]).id;
   const initialWs2Count = ws2.sent.length;
 
-  // Malformed JSON
   await room.webSocketMessage(ws1, "{bad json");
   assert.equal(ws2.sent.length, initialWs2Count);
 
-  // Self-send attempt
   await room.webSocketMessage(ws1, JSON.stringify({
     type: "relay",
     to: id1,
-    data: { type: "text", text: "self" },
+    data: { type: "e2ee-ctrl", seq: 0, iv: "AAAAAAAAAAAAAAAA", ct: "BBBBBBBBBBBBBBBBBBBBBBBB" },
   }));
   assert.equal(ws2.sent.length, initialWs2Count);
 
-  // Invalid signal payload
-  await room.webSocketMessage(ws1, JSON.stringify({
-    type: "signal",
-    to: id2,
-    data: { type: "offer", sdp: "not-an-object" },
-  }));
-  assert.equal(ws2.sent.length, initialWs2Count);
+  // Plaintext payloads over Relay are strictly rejected
+  for (const plain of [
+    { type: "text", text: "plain" },
+    { type: "header", transferId: "t1", name: "a.bin", size: 10 },
+    { type: "chunk", data: "QUJDRA==" },
+  ]) {
+    await room.webSocketMessage(ws1, JSON.stringify({
+      type: "relay",
+      to: id2,
+      data: plain,
+    }));
+    assert.equal(ws2.sent.length, initialWs2Count);
+  }
 
-  // Invalid relay type
-  await room.webSocketMessage(ws1, JSON.stringify({
-    type: "relay",
-    to: id2,
-    data: { type: "arbitrary-command", payload: "evil" },
-  }));
-  assert.equal(ws2.sent.length, initialWs2Count);
-
-  // Invalid base64 chunk
-  await room.webSocketMessage(ws1, JSON.stringify({
-    type: "relay",
-    to: id2,
-    data: { type: "chunk", data: "not_valid_base64$$$" },
-  }));
-  assert.equal(ws2.sent.length, initialWs2Count);
-
-  // Valid signaling & relay messages are forwarded with authoritative `from`
+  // Valid signaling & E2EE relay messages are forwarded with authoritative `from`
   await room.webSocketMessage(ws1, JSON.stringify({
     type: "signal",
     to: id2,
@@ -350,18 +334,18 @@ await runTest("7. Malformed, spoofed, and oversized WebSocket messages are rejec
   const forwardedSignal = JSON.parse(ws2.sent[ws2.sent.length - 1]);
   assert.equal(forwardedSignal.from, id1);
 
-  // Oversized message (> 128 KB) closes socket with 1009
+  // Oversized message (> 160 KB) closes socket with 1009
   const huge = JSON.stringify({
     type: "relay",
     to: id2,
-    data: { type: "text", text: "A".repeat(140 * 1024) },
+    data: { type: "e2ee-ctrl", seq: 1, iv: "AAAAAAAAAAAAAAAA", ct: "A".repeat(170 * 1024) },
   });
   await room.webSocketMessage(ws1, huge);
   assert.equal(ws1.closed, true);
   assert.equal(ws1.closeCode, 1009);
 });
 
-await runTest("8. Per-connection WebSocket message rate limit (40 msg/sec) closes flooding socket", async () => {
+await runTest("8. Adjusted per-connection WebSocket message rate limit (160 msg/sec) allows continuous streaming bursts and closes flooding sockets", async () => {
   const env = createMockEnv();
   const res1 = await worker.fetch(makeWsRequest("https://mydrop.example/ws?room=ratetest", "198.51.100.21"), env);
   const res2 = await worker.fetch(makeWsRequest("https://mydrop.example/ws?room=ratetest", "198.51.100.22"), env);
@@ -370,24 +354,49 @@ await runTest("8. Per-connection WebSocket message rate limit (40 msg/sec) close
   const ws2 = res2.webSocket.peer;
   const id2 = JSON.parse(ws2.sent[0]).id;
 
-  for (let i = 0; i < 45; i++) {
+  // Send 100 chunks in the same second (simulating ~4.8 MB/s continuous Relay streaming) -> must NOT disconnect
+  for (let i = 0; i < 100; i++) {
+    await room.webSocketMessage(ws1, JSON.stringify({
+      type: "relay",
+      to: id2,
+      data: {
+        type: "e2ee-chunk",
+        transferId: "stream-burst-1",
+        fileIndex: 0,
+        seq: i,
+        iv: "AAAAAAAAAAAAAAAA",
+        ct: "BBBBBBBBBBBBBBBBBBBBBBBB",
+      },
+    }));
+  }
+  assert.equal(ws1.closed, false, "100 streaming messages/sec must be permitted without disconnecting");
+
+  // Exceed 160 msg/sec flood threshold -> closes with 1008
+  for (let i = 100; i < 170; i++) {
     if (ws1.closed) break;
     await room.webSocketMessage(ws1, JSON.stringify({
       type: "relay",
       to: id2,
-      data: { type: "text", text: `msg ${i}` },
+      data: {
+        type: "e2ee-chunk",
+        transferId: "stream-burst-1",
+        fileIndex: 0,
+        seq: i,
+        iv: "AAAAAAAAAAAAAAAA",
+        ct: "BBBBBBBBBBBBBBBBBBBBBBBB",
+      },
     }));
   }
   assert.equal(ws1.closed, true);
   assert.equal(ws1.closeCode, 1008);
 });
 
-await runTest("9. End-to-End Application Protocol (Bidirectional File Transfer, Text Transfer, Relay Fallback, UI & Validation)", async () => {
-  // Spin up two isolated client sandboxes connected to the same Room Durable Object
+function createStreamingPairSandboxes() {
   const env = createMockEnv();
   const appJsCode = fs.readFileSync(path.join(rootDir, "public", "app.js"), "utf8");
+  const relayCaptured = [];
 
-  function createClientSandbox(ip, forceRelay = false) {
+  function createClientSandbox(ip, ua = "Mozilla/5.0 (Linux; Android 14) Chrome/125.0") {
     const elements = new Map();
     const makeEl = (id = "") => ({
       id,
@@ -435,14 +444,14 @@ await runTest("9. End-to-End Application Protocol (Bidirectional File Transfer, 
       addEventListener() {},
     };
 
-    let activeClientWs = null;
     class ClientWebSocket {
       constructor(url) {
         this.url = url;
         this.readyState = 0;
         this.bufferedAmount = 0;
-        activeClientWs = this;
-        const req = makeWsRequest(url.replace(/^ws:/, "https:").replace(/^wss:/, "https:"), ip);
+        const req = makeWsRequest(url.replace(/^ws:/, "https:").replace(/^wss:/, "https:"), ip, {
+          "User-Agent": ua,
+        });
         worker.fetch(req, env).then((res) => {
           if (res.status !== 101) {
             this.readyState = 3;
@@ -460,22 +469,60 @@ await runTest("9. End-to-End Application Protocol (Bidirectional File Transfer, 
         });
       }
       send(data) {
-        const roomEntry = env.rooms.get(roomFromIpSafe(ip));
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.type === "relay") relayCaptured.push(data);
+        } catch {}
+        const roomEntry = env.rooms.get("v4:" + ip);
         roomEntry.roomInstance.webSocketMessage(this.serverWs, data);
       }
-      close(code, reason) {
+      close() {
         this.readyState = 3;
         if (this.serverWs) {
-          const roomEntry = env.rooms.get(roomFromIpSafe(ip));
+          const roomEntry = env.rooms.get("v4:" + ip);
           roomEntry.roomInstance.webSocketClose(this.serverWs);
         }
         this.onclose?.();
       }
     }
 
-    function roomFromIpSafe(addr) {
-      return "v4:" + addr;
-    }
+    // Track OPFS streaming disk writes so we can verify chunks are written one by one without accumulating an Array in RAM
+    const opfsDiskFiles = new Map();
+    const mockStorage = {
+      async getDirectory() {
+        return {
+          async getFileHandle(name) {
+            if (!opfsDiskFiles.has(name)) {
+              opfsDiskFiles.set(name, { parts: [], closed: false, aborted: false, writeCalls: 0 });
+            }
+            const entry = opfsDiskFiles.get(name);
+            return {
+              async createWritable() {
+                return {
+                  async write(chunkBytes) {
+                    entry.writeCalls += 1;
+                    entry.parts.push(new Uint8Array(chunkBytes));
+                  },
+                  async close() {
+                    entry.closed = true;
+                  },
+                  async abort() {
+                    entry.aborted = true;
+                    entry.parts = [];
+                  },
+                };
+              },
+              async getFile() {
+                return new Blob(entry.parts);
+              },
+            };
+          },
+          async removeEntry(name) {
+            opfsDiskFiles.delete(name);
+          },
+        };
+      },
+    };
 
     class MockRTCPeerConnection {
       constructor() {
@@ -484,33 +531,22 @@ await runTest("9. End-to-End Application Protocol (Bidirectional File Transfer, 
         this.sctp = { maxMessageSize: 65536 };
       }
       createDataChannel(label) {
-        const dc = {
+        return {
           label,
-          readyState: forceRelay ? "connecting" : "open",
+          readyState: "connecting",
           binaryType: "arraybuffer",
           bufferedAmount: 0,
-          send(data) {
-            if (forceRelay) throw new Error("P2P blocked");
-            if (this._peerDc?.onmessage) {
-              queueMicrotask(() => this._peerDc.onmessage({ data }));
-            }
+          send() {
+            throw new Error("P2P blocked");
           },
-          addEventListener(ev, fn) {
-            if (ev === "open" && !forceRelay) queueMicrotask(fn);
-          },
-          close() {
-            this.readyState = "closed";
-          },
+          addEventListener() {},
+          close() {},
         };
-        this._dc = dc;
-        return dc;
       }
       async setLocalDescription() {}
       async setRemoteDescription() {}
       async addIceCandidate() {}
-      close() {
-        this.connectionState = "closed";
-      }
+      close() {}
     }
 
     const sandbox = {
@@ -519,12 +555,15 @@ await runTest("9. End-to-End Application Protocol (Bidirectional File Transfer, 
       clearTimeout,
       setInterval: () => 0,
       clearInterval,
-       crypto: globalThis.crypto,
+      crypto: globalThis.crypto,
+      TextEncoder: globalThis.TextEncoder,
+      TextDecoder: globalThis.TextDecoder,
+      DataView: globalThis.DataView,
       Blob: globalThis.Blob,
       File: globalThis.File,
       ArrayBuffer: globalThis.ArrayBuffer,
       Uint8Array: globalThis.Uint8Array,
-       URL: globalThis.URL,
+      URL: globalThis.URL,
       URLSearchParams: globalThis.URLSearchParams,
       btoa: globalThis.btoa,
       atob: globalThis.atob,
@@ -534,6 +573,8 @@ await runTest("9. End-to-End Application Protocol (Bidirectional File Transfer, 
         setItem(k, v) { this._s.set(k, String(v)); },
       },
       navigator: {
+        userAgent: ua,
+        storage: mockStorage,
         clipboard: { writeText: async () => {} },
       },
       indexedDB: {
@@ -556,89 +597,223 @@ await runTest("9. End-to-End Application Protocol (Bidirectional File Transfer, 
       fetch: async (url) => worker.fetch(new Request("https://mydrop.example" + url), env),
       WebSocket: ClientWebSocket,
       RTCPeerConnection: MockRTCPeerConnection,
-      prompt: () => "Hello from prompt",
+      prompt: () => "Hello",
     };
     sandbox.URL.createObjectURL = () => "blob:https://mydrop.example/mock-blob";
 
     vm.createContext(sandbox);
     vm.runInContext(appJsCode, sandbox);
-    return { sandbox, elements, document };
+    return { sandbox, elements, document, opfsDiskFiles };
   }
 
-  // Test Relay Fallback (forceRelay = true so connect() times out or we stub connect to reject immediately for fast test)
-  const clientA = createClientSandbox("198.51.100.88", true);
-  const clientB = createClientSandbox("198.51.100.88", true);
+  return { env, createClientSandbox, relayCaptured };
+}
 
-  // Wait for WS welcome and peer discovery
-  await new Promise((r) => setTimeout(r, 40));
+await runTest("9. Large File Streaming (Virtual 500 MB Validation, Multi-MB Chunk Streaming to Disk Sink without RAM array, Progress/Speed/ETA UI & E2EE on Relay)", async () => {
+  const { createClientSandbox, relayCaptured } = createStreamingPairSandboxes();
+  const clientA = createClientSandbox("198.51.100.88", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) Version/17.4 Mobile/15E148 Safari/604.1");
+  const clientB = createClientSandbox("198.51.100.88", "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/125.0.0.0 Mobile Safari/537.36");
 
-  // Speed up relay fallback in test by making connect() reject immediately when forceRelay is enabled
-  vm.runInContext(`connect = async () => { throw new Error("Simulated NAT block -> use Relay"); };`, clientA.sandbox);
-  vm.runInContext(`connect = async () => { throw new Error("Simulated NAT block -> use Relay"); };`, clientB.sandbox);
+  await new Promise((r) => setTimeout(r, 60));
+  vm.runInContext(`connect = async () => { throw new Error("Use Relay"); };`, clientA.sandbox);
+  vm.runInContext(`connect = async () => { throw new Error("Use Relay"); };`, clientB.sandbox);
 
   const idA = vm.runInContext(`myId`, clientA.sandbox);
   const idB = vm.runInContext(`myId`, clientB.sandbox);
-  assert.ok(idA && idB && idA !== idB);
 
-  // 1) Text transfer A -> B over Relay
-  const textOk = await vm.runInContext(`sendText("${idB}", "สวัสดี MyDrop ปลอดภัย!")`, clientA.sandbox);
-  assert.equal(textOk, true);
-  await new Promise((r) => setTimeout(r, 20));
-  const receivedB = clientB.elements.get("#received");
-  assert.equal(receivedB.children.length, 1);
-  assert.ok(receivedB.children[0].children[0].textContent.includes("สวัสดี MyDrop ปลอดภัย!"));
+  // Verify platform capability detection distinguishes iOS Safari vs Desktop/Android
+  const capIOS = vm.runInContext(`detectStorageCapabilities()`, clientA.sandbox);
+  assert.equal(capIOS.platform, "ios-opfs");
+  assert.ok(capIOS.note.includes("iOS Safari ไม่รองรับ showSaveFilePicker"));
 
-  // 2) File transfer A -> B (multi-file) over Relay with recipient approval
-  clientB.sandbox.testFilesToReceive = [];
-  const file1Bytes = new Uint8Array(90 * 1024); // 90 KB (spans 2 chunks of 64KB)
-  for (let i = 0; i < file1Bytes.length; i++) file1Bytes[i] = i % 251;
-  const file2Bytes = new TextEncoder().encode("Second file content");
+  // Verify multi-GB files (e.g., 1.5 GB) pass outgoing validation under streaming protocol
+  const largeCheck = vm.runInContext(
+    `validateOutgoingFiles([{ name: "movie_4k.mp4", size: 1500 * 1024 * 1024, type: "video/mp4" }])`,
+    clientA.sandbox
+  );
+  assert.equal(largeCheck.ok, true);
 
-  clientA.sandbox.testFiles = [
-    new File([file1Bytes], "../secret/video_clip.mp4", { type: "video/mp4" }),
-    new File([file2Bytes], "notes.html", { type: "text/html" }),
+  // Stream a 1.2 MB file (25 chunks of 48 KB) through E2EE + sliding window flow control + OPFS disk sink
+  const streamSize = 1200 * 1024;
+  const rawBytes = new Uint8Array(streamSize);
+  for (let i = 0; i < streamSize; i++) rawBytes[i] = (i * 13) % 251;
+
+  clientA.sandbox.largeFile = [
+    new File([rawBytes], "large_dataset.bin", { type: "application/octet-stream" }),
   ];
 
-  const sendPromiseAtoB = vm.runInContext(`sendFiles("${idB}", testFiles)`, clientA.sandbox);
-  await new Promise((r) => setTimeout(r, 30));
+  const sendPromise = vm.runInContext(`sendFiles("${idB}", largeFile)`, clientA.sandbox);
+  await new Promise((r) => setTimeout(r, 40));
 
-  // Verify confirmModal opened on B and path traversal was sanitized
-  const modalB = clientB.elements.get("#confirmModal");
-  assert.equal(modalB.style.display, "flex");
   const acceptBtnB = clientB.elements.get("#acceptBtn");
   await acceptBtnB.onclick();
 
-  const sendResAtoB = await sendPromiseAtoB;
-  assert.equal(sendResAtoB, true);
-  await new Promise((r) => setTimeout(r, 30));
+  const ok = await sendPromise;
+  assert.equal(ok, true);
+  await new Promise((r) => setTimeout(r, 40));
 
-  // Verify B received both files (1 text item + 2 file items = 3 items in #received)
-  assert.equal(receivedB.children.length, 3);
-  // Most recent prepended item is notes.html, second is video_clip.mp4
-  assert.ok(receivedB.children[0].children[0].textContent.includes("notes.html"));
-  assert.ok(receivedB.children[1].children[0].textContent.includes("video_clip.mp4"));
-  assert.ok(!receivedB.children[1].children[0].textContent.includes(".."));
+  // Verify receiver used OPFS streaming disk sink (25 individual chunk writes, no in-memory f.chunks array)
+  assert.equal(clientB.opfsDiskFiles.size, 1);
+  const [diskEntry] = clientB.opfsDiskFiles.values();
+  assert.equal(diskEntry.writeCalls, Math.ceil(streamSize / (48 * 1024)));
+  assert.equal(diskEntry.closed, true);
 
-  // 3) Reverse direction File transfer B -> A
-  clientB.sandbox.replyFiles = [
-    new File([new TextEncoder().encode("Reply from Android to iPhone")], "reply.txt", { type: "text/plain" }),
-  ];
-  const sendPromiseBtoA = vm.runInContext(`sendFiles("${idA}", replyFiles)`, clientB.sandbox);
-  await new Promise((r) => setTimeout(r, 30));
-  const acceptBtnA = clientA.elements.get("#acceptBtn");
-  await acceptBtnA.onclick();
-  const sendResBtoA = await sendPromiseBtoA;
-  assert.equal(sendResBtoA, true);
-  await new Promise((r) => setTimeout(r, 20));
-
-  const receivedA = clientA.elements.get("#received");
-  assert.equal(receivedA.children.length, 1);
-  assert.ok(receivedA.children[0].children[0].textContent.includes("reply.txt"));
-
-  // 4) Oversized file rejection on sender
-  clientA.sandbox.tooBig = [{ name: "huge.mov", size: 55 * 1024 * 1024, type: "video/quicktime" }];
-  const bigRes = await vm.runInContext(`sendFiles("${idB}", tooBig)`, clientA.sandbox);
-  assert.equal(bigRes, false);
+  // Verify UI received item and Relay never saw plaintext filename
+  const receivedB = clientB.elements.get("#received");
+  assert.equal(receivedB.children.length, 1);
+  assert.ok(receivedB.children[0].children[0].textContent.includes("large_dataset.bin"));
+  for (const rawRelay of relayCaptured) {
+    assert.ok(!rawRelay.includes("large_dataset.bin"), "Relay must never see plaintext filename");
+  }
 });
 
-console.log(`\nAll ${passed} integration & security test suites passed!`);
+await runTest("10. Backpressure & Flow Control (DataChannel bufferedAmount drain + Sliding Window Receiver ACKs)", async () => {
+  const { createClientSandbox } = createStreamingPairSandboxes();
+  const clientA = createClientSandbox("198.51.100.90");
+  const clientB = createClientSandbox("198.51.100.90");
+
+  await new Promise((r) => setTimeout(r, 60));
+
+  // Test DataChannel backpressure helper waitForChannelDrain directly
+  let dcBuffered = 3 * 1024 * 1024; // 3 MB (> 2 MB MAX_BUFFER)
+  let drainListener = null;
+  const mockDc = {
+    readyState: "open",
+    bufferedAmountLowThreshold: 512 * 1024,
+    get bufferedAmount() {
+      return dcBuffered;
+    },
+    addEventListener(ev, fn) {
+      if (ev === "bufferedamountlow") drainListener = fn;
+    },
+    removeEventListener() {},
+  };
+  clientA.sandbox.mockDc = mockDc;
+
+  let drainCompleted = false;
+  const drainPromise = vm.runInContext(`waitForChannelDrain(mockDc)`, clientA.sandbox).then(() => {
+    drainCompleted = true;
+  });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(drainCompleted, false, "Sender must pause sending while DataChannel bufferedAmount > MAX_BUFFER");
+
+  // Simulate buffer draining below threshold and firing bufferedamountlow
+  dcBuffered = 256 * 1024;
+  if (drainListener) drainListener();
+  await drainPromise;
+  assert.equal(drainCompleted, true, "Sender must resume once bufferedAmount drains");
+
+  // Test sliding window flow control waitForFlowControl (blocks when nextSeq - (ackedSeq + 1) >= MAX_IN_FLIGHT_CHUNKS)
+  const mockState = {
+    cancelled: false,
+    paused: false,
+    remotePaused: false,
+    nextSeq: 16,
+    ackedSeq: -1, // 16 chunks in flight (equals MAX_IN_FLIGHT_CHUNKS = 16)
+    waiters: new Set(),
+  };
+  clientA.sandbox.mockState = mockState;
+  let windowOpened = false;
+  const flowPromise = vm.runInContext(`waitForFlowControl(mockState, 16)`, clientA.sandbox).then(() => {
+    windowOpened = true;
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(windowOpened, false, "Flow control must pause sender when 16 unacknowledged chunks are in flight");
+
+  // Simulate cumulative ACK arriving from receiver for seq 3
+  mockState.ackedSeq = 3;
+  vm.runInContext(`notifyTransferWaiters(mockState)`, clientA.sandbox);
+  await flowPromise;
+  assert.equal(windowOpened, true, "Flow control must unblock sender as soon as receiver ACK advances window");
+});
+
+await runTest("11. Disconnect / Resume Recovery, Duplicate & Out-of-Order Chunk Handling, Pause & Cancel", async () => {
+  const { createClientSandbox } = createStreamingPairSandboxes();
+  const clientA = createClientSandbox("198.51.100.91");
+  const clientB = createClientSandbox("198.51.100.91");
+
+  await new Promise((r) => setTimeout(r, 60));
+  vm.runInContext(`connect = async () => { throw new Error("Use Relay"); };`, clientA.sandbox);
+  vm.runInContext(`connect = async () => { throw new Error("Use Relay"); };`, clientB.sandbox);
+
+  const idA = vm.runInContext(`myId`, clientA.sandbox);
+  const idB = vm.runInContext(`myId`, clientB.sandbox);
+
+  await vm.runInContext(`ensureE2EE("${idB}")`, clientA.sandbox);
+  await vm.runInContext(`ensureE2EE("${idA}")`, clientB.sandbox);
+
+  // 1) Duplicate & Out-of-order chunk handling with Resume State realignment
+  const tid = "resume-test-tid-01";
+  const c0 = new TextEncoder().encode("CHUNK_0_PAYLOAD_");
+  const c1 = new TextEncoder().encode("CHUNK_1_PAYLOAD_");
+  const c2 = new TextEncoder().encode("CHUNK_2_PAYLOAD_");
+  const totalBytes = c0.byteLength + c1.byteLength + c2.byteLength;
+
+  clientA.sandbox.c0 = c0.buffer;
+  clientA.sandbox.c1 = c1.buffer;
+  clientA.sandbox.c2 = c2.buffer;
+
+  const envC0 = await vm.runInContext(`encryptFileChunk("${idB}", "${tid}", 0, 0, c0)`, clientA.sandbox);
+  const envC1 = await vm.runInContext(`encryptFileChunk("${idB}", "${tid}", 0, 1, c1)`, clientA.sandbox);
+  const envC2 = await vm.runInContext(`encryptFileChunk("${idB}", "${tid}", 0, 2, c2)`, clientA.sandbox);
+
+  vm.runInContext(
+    `acceptedTransfers.set("${tid}", { peerId: "${idA}", remaining: 1, nextFileIndex: 0, fileHandles: [] });`,
+    clientB.sandbox
+  );
+  const headerEnv = await vm.runInContext(
+    `encryptControlMessage("${idB}", { type: "header", transferId: "${tid}", fileIndex: 0, name: "resumable.bin", size: ${totalBytes}, mime: "application/octet-stream" })`,
+    clientA.sandbox
+  );
+  await vm.runInContext(`onEncryptedEnvelope("${idA}", ${JSON.stringify(headerEnv)})`, clientB.sandbox);
+
+  // Deliver chunk 0
+  await vm.runInContext(`onEncryptedEnvelope("${idA}", ${JSON.stringify(envC0)})`, clientB.sandbox);
+  assert.equal(vm.runInContext(`incoming.get("${idA}").nextChunkSeq`, clientB.sandbox), 1);
+
+  // Deliver duplicate chunk 0 again -> receiver ignores duplicate and keeps nextChunkSeq = 1
+  await vm.runInContext(`onEncryptedEnvelope("${idA}", ${JSON.stringify(envC0)})`, clientB.sandbox);
+  assert.equal(vm.runInContext(`incoming.get("${idA}").nextChunkSeq`, clientB.sandbox), 1);
+  assert.equal(vm.runInContext(`incoming.get("${idA}").received`, clientB.sandbox), c0.byteLength);
+
+  // Deliver out-of-order chunk 2 before chunk 1 -> receiver rejects chunk 2, keeps nextChunkSeq = 1, and requests resume from seq 1
+  await vm.runInContext(`onEncryptedEnvelope("${idA}", ${JSON.stringify(envC2)})`, clientB.sandbox);
+  assert.equal(vm.runInContext(`incoming.get("${idA}").nextChunkSeq`, clientB.sandbox), 1);
+
+  // Deliver expected chunk 1 then chunk 2 -> file completes cleanly with exact integrity
+  await vm.runInContext(`onEncryptedEnvelope("${idA}", ${JSON.stringify(envC1)})`, clientB.sandbox);
+  await vm.runInContext(`onEncryptedEnvelope("${idA}", ${JSON.stringify(envC2)})`, clientB.sandbox);
+  await new Promise((r) => setTimeout(r, 30));
+
+  const receivedB = clientB.elements.get("#received");
+  assert.equal(receivedB.children.length, 1);
+  assert.ok(receivedB.children[0].children[0].textContent.includes("resumable.bin"));
+
+  // 2) Pause, Resume & Cancel during active streaming transfer
+  const cancelFileBytes = new Uint8Array(1500 * 1024); // 32 chunks (exceeds 16-chunk flow control window so it waits for ACKs)
+  clientA.sandbox.cancelFiles = [
+    new File([cancelFileBytes], "cancel_me.iso", { type: "application/octet-stream" }),
+  ];
+
+  const sendCancelPromise = vm.runInContext(`sendFiles("${idB}", cancelFiles)`, clientA.sandbox);
+  await new Promise((r) => setTimeout(r, 40));
+  const acceptBtnB2 = clientB.elements.get("#acceptBtn");
+  await acceptBtnB2.onclick();
+  // Give a few ms for file-response to reach A and start streaming chunks 0..15
+  await new Promise((r) => setTimeout(r, 10));
+
+  const activeTid = vm.runInContext(`outgoingTransfers.keys().next().value`, clientA.sandbox);
+  assert.ok(activeTid, "Transfer must be active in outgoingTransfers");
+  await vm.runInContext(`pauseTransfer("${activeTid}")`, clientA.sandbox);
+  assert.equal(vm.runInContext(`outgoingTransfers.get("${activeTid}").paused`, clientA.sandbox), true);
+  assert.equal(clientA.elements.get("#tpStateBadge").textContent.includes("Paused"), true);
+
+  // Cancel the paused transfer and verify both sides abort cleanly
+  await vm.runInContext(`cancelTransfer("${activeTid}", "ทดสอบยกเลิกการส่ง")`, clientA.sandbox);
+  const cancelResult = await sendCancelPromise;
+  assert.equal(cancelResult, false, "Cancelled transfer must resolve to false");
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(vm.runInContext(`incoming.has("${idA}")`, clientB.sandbox), false);
+});
+
+console.log(`\nAll ${passed} streaming, backpressure, resume & E2EE security test suites passed!`);

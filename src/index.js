@@ -3,15 +3,12 @@ import { DurableObject } from "cloudflare:workers";
 const MAX_ROOM_CONNECTIONS = 12;
 const MAX_CONNS_PER_IP = 8;
 const MAX_CONN_ATTEMPTS_PER_IP_PER_MIN = 30;
-const MAX_WS_MESSAGE_BYTES = 128 * 1024;
+const MAX_WS_MESSAGE_BYTES = 160 * 1024;
 const MAX_SIGNAL_BYTES = 32 * 1024;
-const MAX_RELAY_BYTES = 112 * 1024;
-const MAX_MESSAGES_PER_SECOND = 40;
+const MAX_RELAY_BYTES = 140 * 1024;
+const MAX_MESSAGES_PER_SECOND = 160; // Adjusted to sustain continuous chunk streaming + ACKs without false disconnect
 const MAX_FILES_PER_TRANSFER = 10;
-const MAX_FILE_SIZE = 50 * 1024 * 1024;
-const MAX_TRANSFER_SIZE = 100 * 1024 * 1024;
-const MAX_TEXT_LENGTH = 16 * 1024;
-const MAX_RELAY_CHUNK_B64_LEN = 96 * 1024;
+const MAX_ENVELOPE_CT_B64_LEN = 120 * 1024;
 const ROOM_CODE_RE = /^[a-zA-Z0-9_-]{3,48}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -327,58 +324,60 @@ function isValidSignalPayload(data) {
   if (data.type === "ice") {
     return Boolean(data.candidate && typeof data.candidate === "object" && typeof data.candidate.candidate === "string");
   }
+  if (data.type === "e2ee-key" || data.type === "e2ee-ack") {
+    return (
+      typeof data.pub === "string" &&
+      data.pub.length >= 40 &&
+      data.pub.length <= 256 &&
+      BASE64_RE.test(data.pub) &&
+      typeof data.nonce === "string" &&
+      data.nonce.length >= 16 &&
+      data.nonce.length <= 64 &&
+      BASE64_RE.test(data.nonce)
+    );
+  }
   return false;
 }
 
+// Relay strictly prohibits plaintext payloads (`text`, `file-request`, `header`, raw `chunk`).
+// Only E2EE encrypted control (`e2ee-ctrl`) and streaming chunk (`e2ee-chunk`) envelopes are permitted.
 function isValidRelayPayload(data) {
   if (!data || typeof data !== "object" || typeof data.type !== "string") return false;
-  switch (data.type) {
-    case "text":
-      return typeof data.text === "string" && data.text.length > 0 && data.text.length <= MAX_TEXT_LENGTH;
-    case "file-request": {
-      if (typeof data.transferId !== "string" || data.transferId.length > 80) return false;
-      if (!Array.isArray(data.files) || data.files.length < 1 || data.files.length > MAX_FILES_PER_TRANSFER) return false;
-      let total = 0;
-      for (const f of data.files) {
-        if (!f || typeof f !== "object") return false;
-        if (typeof f.name !== "string" || f.name.length < 1 || f.name.length > 255) return false;
-        if (!Number.isSafeInteger(f.size) || f.size < 0 || f.size > MAX_FILE_SIZE) return false;
-        if (f.mime !== undefined && (typeof f.mime !== "string" || f.mime.length > 255)) return false;
-        total += f.size;
-      }
-      return total <= MAX_TRANSFER_SIZE;
-    }
-    case "file-response":
-      return (
-        typeof data.transferId === "string" &&
-        data.transferId.length > 0 &&
-        data.transferId.length <= 80 &&
-        typeof data.accepted === "boolean"
-      );
-    case "header":
-      return (
-        typeof data.transferId === "string" &&
-        data.transferId.length > 0 &&
-        data.transferId.length <= 80 &&
-        typeof data.name === "string" &&
-        data.name.length > 0 &&
-        data.name.length <= 255 &&
-        Number.isSafeInteger(data.size) &&
-        data.size >= 0 &&
-        data.size <= MAX_FILE_SIZE &&
-        (data.mime === undefined || (typeof data.mime === "string" && data.mime.length <= 255))
-      );
-    case "chunk":
-      return (
-        typeof data.data === "string" &&
-        data.data.length > 0 &&
-        data.data.length <= MAX_RELAY_CHUNK_B64_LEN &&
-        data.data.length % 4 === 0 &&
-        BASE64_RE.test(data.data)
-      );
-    default:
-      return false;
+  if (data.type === "e2ee-ctrl") {
+    return (
+      Number.isSafeInteger(data.seq) &&
+      data.seq >= 0 &&
+      typeof data.iv === "string" &&
+      data.iv.length === 16 &&
+      BASE64_RE.test(data.iv) &&
+      typeof data.ct === "string" &&
+      data.ct.length >= 24 &&
+      data.ct.length <= MAX_ENVELOPE_CT_B64_LEN &&
+      data.ct.length % 4 === 0 &&
+      BASE64_RE.test(data.ct)
+    );
   }
+  if (data.type === "e2ee-chunk") {
+    return (
+      typeof data.transferId === "string" &&
+      data.transferId.length > 0 &&
+      data.transferId.length <= 80 &&
+      Number.isSafeInteger(data.fileIndex) &&
+      data.fileIndex >= 0 &&
+      data.fileIndex < MAX_FILES_PER_TRANSFER &&
+      Number.isSafeInteger(data.seq) &&
+      data.seq >= 0 &&
+      typeof data.iv === "string" &&
+      data.iv.length === 16 &&
+      BASE64_RE.test(data.iv) &&
+      typeof data.ct === "string" &&
+      data.ct.length >= 24 &&
+      data.ct.length <= MAX_ENVELOPE_CT_B64_LEN &&
+      data.ct.length % 4 === 0 &&
+      BASE64_RE.test(data.ct)
+    );
+  }
+  return false;
 }
 
 function randomName() {
@@ -393,4 +392,3 @@ function detectDevice(ua) {
   if (/iPad|Android|Tablet/i.test(ua)) return "tablet";
   return "desktop";
 }
-
