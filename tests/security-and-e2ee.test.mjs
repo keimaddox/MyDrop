@@ -1091,6 +1091,23 @@ await runTest("D. Web & Cloudflare Security", "Verify HTTP Security Headers, CSP
   });
   assert.equal(roomFromIp("2001:db8:85a3::8a2e:370:7334"), "v6:2001:0db8:85a3:0000");
   assert.equal(roomFromIp("::ffff:192.168.1.1"), "v4:192.168.1.1");
+
+  // 4. Reconnect token hijacking from a different IP/subnet is blocked (VULN-01)
+  const victimConn = await connectClientToRoom(env, "ip-bound-room", "203.0.113.10");
+  const victimWelcome = JSON.parse(victimConn.webSocket.peer.sent[0]);
+  const hijackerConn = await connectClientToRoom(env, "ip-bound-room", "198.51.100.99", victimWelcome.reconnectToken);
+  const hijackerWelcome = JSON.parse(hijackerConn.webSocket.peer.sent[0]);
+  assert.notEqual(hijackerWelcome.id, victimWelcome.id, "Cross-IP reconnect token hijacking must be rejected!");
+  assert.equal(victimConn.webSocket.peer.closed, false, "Victim socket must remain open!");
+
+  // 5. Global per-IP connection rate limit prevents multi-room sharding bypass (VULN-05)
+  let shardStatus = 101;
+  for (let i = 0; i < SERVER_LIMITS.MAX_CONN_ATTEMPTS_PER_IP_PER_MIN + 5; i++) {
+    const r = await connectClientToRoom(env, `shard-room-${i}`, "192.0.2.77");
+    shardStatus = r.status;
+    if (r.webSocket) r.webSocket.peer.close();
+  }
+  assert.equal(shardStatus, 429, "Multi-room connection sharding from same IP must hit 429 rate limit!");
 });
 
 console.log(`\n🎉 All ${results.length} test suites passed successfully!`);

@@ -12,6 +12,8 @@ const SECURITY_LIMITS = {
   E2EE_HANDSHAKE_TIMEOUT_MS: 8000,        // 8s timeout for ECDH key exchange
   MAX_SEEN_REQUEST_IDS: 500,              // Bounded replay cache size
   MAX_RETAINED_BLOBS: 25,                 // Max retained Object URLs before auto-revoking oldest
+  MAX_RECEIVED_ITEMS: 50,                 // Max retained DOM items in #received inbox
+  MAX_CLIENT_CTRL_PER_10S: 60,            // Max incoming decrypted control/text messages per peer per 10s
   ROOM_CODE_MIN_LEN: 3,
   ROOM_CODE_MAX_LEN: 64,
 };
@@ -98,6 +100,7 @@ const seenRequests = new Set();      // Bounded set of transferIds
 const peerStatus = new Map();        // peerId -> string
 const peerProgress = new Map();      // peerId -> { ratio, label }
 const peerElements = new Map();      // peerId -> HTMLElement
+const peerClientRate = new Map();    // peerId -> { windowStart, count }
 const requestQueue = [];             // Bounded queue of incoming file requests
 const activeObjectUrls = [];         // Bounded list of created blob: URLs for cleanup
 let activeRequest = null;
@@ -495,6 +498,7 @@ function cleanupPeerState(peerId) {
 
   peerStatus.delete(peerId);
   peerProgress.delete(peerId);
+  peerClientRate.delete(peerId);
 }
 
 function cleanupAllPeers(reason = "reset") {
@@ -797,7 +801,20 @@ async function deriveSessionKeys(sess, peerId, peerPubB64, peerNonceB64) {
     return;
   }
 
+  if (typeof peerPubB64 !== "string" || typeof peerNonceB64 !== "string") {
+    throw new Error("Invalid E2EE public key or nonce type");
+  }
   const peerPubBuf = base64ToBuf(peerPubB64);
+  const peerPubBytes = new Uint8Array(peerPubBuf);
+  // Strictly verify uncompressed P-256 public key format (65 bytes starting with 0x04)
+  if (peerPubBytes.byteLength !== 65 || peerPubBytes[0] !== 0x04) {
+    throw new Error("Invalid P-256 uncompressed public key format");
+  }
+  const peerNonceBuf = base64ToBuf(peerNonceB64);
+  if (peerNonceBuf.byteLength !== 16) {
+    throw new Error("Invalid E2EE nonce length");
+  }
+
   const peerPubKey = await crypto.subtle.importKey(
     "raw",
     peerPubBuf,
@@ -909,12 +926,26 @@ function sendHandshakePacket(peerId, pkt) {
   }
 }
 
+function hasActivePeerTransaction(peerId) {
+  if (incoming.has(peerId)) return true;
+  for (const p of pendingResponses.values()) {
+    if (p.peerId === peerId) return true;
+  }
+  for (const a of acceptedTransfers.values()) {
+    if (a.peerId === peerId) return true;
+  }
+  return false;
+}
+
 async function handleE2EEHandshake(peerId, data) {
   try {
     const sess = await createOrGetLocalE2EEState(peerId);
     if (data.type === "e2ee-init") {
-      // If we already established a session with a different nonce, re-key cleanly
+      // Prevent mid-transfer session reset DoS when a transfer or approval with this peer is already active
       if (sess.state === "established" && sess.peerNonceB64 && sess.peerNonceB64 !== data.nonce) {
+        if (hasActivePeerTransaction(peerId)) {
+          return;
+        }
         e2eeSessions.delete(peerId);
         return handleE2EEHandshake(peerId, data);
       }
@@ -943,7 +974,21 @@ async function handleE2EEHandshake(peerId, data) {
       });
     } else if (data.type === "e2ee-confirm") {
       if (sess.state !== "established" || !sess.rxKey) return;
+      if (typeof data.iv !== "string" || typeof data.ct !== "string") {
+        throw new Error("Malformed e2ee-confirm packet");
+      }
+      if (sess.seenRxNonces.has(data.iv)) {
+        return;
+      }
       const iv = new Uint8Array(base64ToBuf(data.iv));
+      const expectedConfirmIv = buildDeterministicIv(sess.rxSalt, 0x03, 1);
+      if (
+        iv.byteLength !== 12 ||
+        iv[4] !== 0x03 ||
+        ! iv.every((b, idx) => b === expectedConfirmIv[idx])
+      ) {
+        throw new Error("Invalid e2ee-confirm IV structure");
+      }
       const aad = textEncoder.encode(`MyDrop-Confirm-v1|${peerId}|${myId}`);
       const plainBuf = await crypto.subtle.decrypt(
         { name: "AES-GCM", iv, additionalData: aad },
@@ -954,6 +999,8 @@ async function handleE2EEHandshake(peerId, data) {
       if (confirmedHash !== sess.transcriptHashB64) {
         throw new Error("E2EE key confirmation mismatch");
       }
+      sess.seenRxNonces.add(data.iv);
+      sess.peerConfirmed = true;
     }
   } catch (err) {
     console.error("E2EE handshake error:", err);
@@ -1646,8 +1693,33 @@ function resetIncomingWatchdog(peerId, f) {
   }, SECURITY_LIMITS.CHUNK_INACTIVITY_TIMEOUT_MS);
 }
 
+function checkPeerControlRate(peerId) {
+  const now = Date.now();
+  let state = peerClientRate.get(peerId);
+  if (!state || now - state.windowStart >= 10000) {
+    state = { windowStart: now, count: 0 };
+    peerClientRate.set(peerId, state);
+  }
+  state.count += 1;
+  return state.count <= SECURITY_LIMITS.MAX_CLIENT_CTRL_PER_10S;
+}
+
+function refreshAcceptedTransferTimer(approved) {
+  if (!approved) return;
+  clearTimeout(approved.timer);
+  approved.timer = setTimeout(() => {
+    for (const [tid, entry] of acceptedTransfers) {
+      if (entry === approved) {
+        cleanupAcceptedTransfer(tid);
+        break;
+      }
+    }
+  }, SECURITY_LIMITS.REQUEST_TIMEOUT_MS);
+}
+
 function onDecryptedControl(peerId, msg) {
   if (!msg || typeof msg !== "object") return;
+  if (!checkPeerControlRate(peerId)) return;
 
   if (msg.type === "text") {
     if (typeof msg.text !== "string" || !msg.text.trim()) return;
@@ -1802,6 +1874,7 @@ async function onEncryptedChunk(peerId, packet) {
   f.received += plainBuf.byteLength;
   f.expectedChunkIndex += 1;
   approved.receivedTotalBytes += plainBuf.byteLength;
+  refreshAcceptedTransferTimer(approved);
 
   if (packet.last && f.received !== f.meta.size) {
     abortPeerTransfer(peerId, "ข้อมูลไฟล์ไม่ครบตามขนาดที่ระบุ");
@@ -1934,8 +2007,12 @@ function finishFile(peerId) {
   incoming.delete(peerId);
 
   const approved = acceptedTransfers.get(f.transferId);
-  if (approved && approved.nextFileIndex >= approved.files.length) {
-    cleanupAcceptedTransfer(f.transferId);
+  if (approved) {
+    if (approved.nextFileIndex >= approved.files.length) {
+      cleanupAcceptedTransfer(f.transferId);
+    } else {
+      refreshAcceptedTransferTimer(approved);
+    }
   }
 
   const safeMime = getSafeDownloadMime(f.meta.name, f.meta.mime);
@@ -2130,6 +2207,24 @@ function revokeAndRemoveItem(url, itemElement) {
   itemElement.remove();
 }
 
+function enforceReceivedInboxCap() {
+  const box = $("#received");
+  if (!box || !Array.isArray(box.children)) {
+    // Handle both real DOM NodeList/HTMLCollection and mock test arrays
+    while (box?.children && box.children.length > SECURITY_LIMITS.MAX_RECEIVED_ITEMS) {
+      const last = box.children[box.children.length - 1];
+      if (!last) break;
+      if (Array.isArray(box.children)) box.children.pop();
+      else last.remove?.();
+    }
+    return;
+  }
+  while (box.children.length > SECURITY_LIMITS.MAX_RECEIVED_ITEMS) {
+    const oldestEl = box.children.pop();
+    oldestEl?.remove?.();
+  }
+}
+
 function addReceivedFile(from, name, blob, isDangerous = false) {
   const safeName = sanitizeFilename(name);
   const dangerous = isDangerous || isDangerousFile(safeName, blob.type);
@@ -2178,6 +2273,7 @@ function addReceivedFile(from, name, blob, isDangerous = false) {
   item.append(infoWrap, actions);
   registerObjectUrl(objUrl, item);
   $("#received").prepend(item);
+  enforceReceivedInboxCap();
 }
 
 function addReceivedText(from, text) {
@@ -2209,6 +2305,7 @@ function addReceivedText(from, text) {
   actions.append(btn, dismissBtn);
   item.append(t, actions);
   $("#received").prepend(item);
+  enforceReceivedInboxCap();
 }
 
 function toast(text) {

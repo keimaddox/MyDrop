@@ -1,4 +1,4 @@
-const CACHE_NAME = "mydrop-v4";
+const CACHE_NAME = "mydrop-v5";
 const ASSETS = [
   "/",
   "/index.html",
@@ -13,7 +13,28 @@ const SHARE_LIMITS = {
   MAX_FILE_SIZE: 50 * 1024 * 1024,
   MAX_TOTAL_SIZE: 100 * 1024 * 1024,
   MAX_TEXT_CHARS: 16384,
+  MAX_FILENAME_LENGTH: 255,
 };
+
+const BIDI_AND_CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const WINDOWS_RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+
+function sanitizeSharedFilename(rawName) {
+  if (typeof rawName !== "string") return "shared_file";
+  let clean = rawName
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop()
+    .replace(BIDI_AND_CONTROL_CHARS, "")
+    .replace(/[<>:"|?*]/g, "_")
+    .trim()
+    .replace(/^\.+/, "")
+    .replace(/\.+$/, "");
+  if (!clean || WINDOWS_RESERVED_NAMES.test(clean)) {
+    clean = "file_" + (clean || "unnamed");
+  }
+  return clean.slice(0, SHARE_LIMITS.MAX_FILENAME_LENGTH);
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -52,8 +73,18 @@ function saveSharedData(payload) {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
-  // รับข้อมูลจาก Web Share Target (POST /share-target) พร้อมตรวจสอบขีดจำกัดความปลอดภัย
+  // รับข้อมูลจาก Web Share Target (POST /share-target) พร้อมตรวจสอบ Origin/Sec-Fetch-Site และขีดจำกัดความปลอดภัย
   if (url.pathname === "/share-target" && event.request.method === "POST") {
+    const reqOrigin = event.request.headers.get("Origin");
+    const secFetchSite = event.request.headers.get("Sec-Fetch-Site");
+    if (
+      (reqOrigin && reqOrigin !== "null" && reqOrigin !== self.location.origin) ||
+      (secFetchSite && secFetchSite === "cross-site")
+    ) {
+      event.respondWith(new Response("Forbidden cross-site share target request", { status: 403 }));
+      return;
+    }
+
     event.respondWith((async () => {
       try {
         const formData = await event.request.formData();
@@ -65,8 +96,10 @@ self.addEventListener("fetch", (event) => {
           if (files.length >= SHARE_LIMITS.MAX_FILES) break;
           if (f.size > SHARE_LIMITS.MAX_FILE_SIZE) continue;
           if (totalBytes + f.size > SHARE_LIMITS.MAX_TOTAL_SIZE) break;
-          files.push(f);
-          totalBytes += f.size;
+          const safeName = sanitizeSharedFilename(f.name);
+          const safeFile = safeName === f.name ? f : new File([f], safeName, { type: f.type, lastModified: f.lastModified });
+          files.push(safeFile);
+          totalBytes += safeFile.size;
         }
 
         const title = String(formData.get("title") || "").slice(0, 2048);
@@ -94,18 +127,19 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Network-first สำหรับไฟล์ static ของแอป เพื่อให้ได้อัปเดตล่าสุดเสมอ และ fallback เป็น cache เมื่อออฟไลน์
+  // Network-first สำหรับไฟล์ static ของแอป โดยใช้คีย์แบบตัด query string (?room=...) เพื่อไม่ให้รหัสห้องถูกเก็บลง Cache Storage บนดิสก์
   if (event.request.method === "GET" && ASSETS.includes(url.pathname)) {
+    const cacheKeyUrl = new URL(url.pathname, self.location.origin).toString();
     event.respondWith(
       fetch(event.request)
         .then((res) => {
           if (res.ok && res.type === "basic") {
             const copy = res.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+            caches.open(CACHE_NAME).then((cache) => cache.put(cacheKeyUrl, copy));
           }
           return res;
         })
-        .catch(() => caches.match(event.request))
+        .catch(() => caches.match(cacheKeyUrl))
     );
   }
 });

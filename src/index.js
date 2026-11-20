@@ -14,6 +14,7 @@ export const SERVER_LIMITS = {
   MAX_CHUNK_MSG_PER_10S: 650,   // Max 650 encrypted chunk messages per 10s window
   MAX_RELAY_BYTES_PER_MIN: 35 * 1024 * 1024, // Max ~25MB plaintext (~35MB base64) per minute per WS over Relay
   RECONNECT_TTL_MS: 60000,      // 60s window for authenticated token reconnect
+  MAX_RECONNECT_CACHE_SIZE: 200, // Max cached reconnect tokens per room DO
   TURN_CREDENTIAL_TTL: 3600,    // 1 hour short-lived TURN credentials
 };
 
@@ -30,7 +31,7 @@ const CONTENT_SECURITY_POLICY = [
   "script-src 'self'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
-  "connect-src 'self' wss: ws:",
+  "connect-src 'self'",
   "worker-src 'self'",
   "manifest-src 'self'",
   "base-uri 'self'",
@@ -43,7 +44,18 @@ const CONTENT_SECURITY_POLICY = [
 export function withSecurityHeaders(response, request) {
   if (!response || response.status === 101) return response;
   const headers = new Headers(response.headers);
-  headers.set("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+  let csp = CONTENT_SECURITY_POLICY;
+
+  if (request) {
+    const url = new URL(request.url);
+    const isHttps = url.protocol === "https:";
+    const wsOrigin = `${isHttps ? "wss:" : "ws:"}//${url.host}`;
+    csp = CONTENT_SECURITY_POLICY.replace("connect-src 'self'", `connect-src 'self' ${wsOrigin}`);
+    if (isHttps && !isLocalHost(url.hostname)) {
+      headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+    }
+  }
+  headers.set("Content-Security-Policy", csp);
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Frame-Options", "DENY");
   headers.set("Referrer-Policy", "no-referrer");
@@ -53,14 +65,6 @@ export function withSecurityHeaders(response, request) {
   );
   headers.set("Cross-Origin-Opener-Policy", "same-origin");
   headers.set("Cross-Origin-Resource-Policy", "same-origin");
-
-  if (request) {
-    const url = new URL(request.url);
-    const proto = request.headers.get("X-Forwarded-Proto") || url.protocol.replace(":", "");
-    if (proto === "https" && !isLocalHost(url.hostname)) {
-      headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
-    }
-  }
 
   return new Response(response.body, {
     status: response.status,
@@ -109,13 +113,12 @@ export function validateRoomCode(code) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const forwardedProto = request.headers.get("X-Forwarded-Proto");
 
-    // Enforce HTTPS in production environments
+    // Enforce HTTPS in production environments using authoritative URL protocol
     if (
-      (url.protocol === "http:" || forwardedProto === "http") &&
+      url.protocol === "http:" &&
       !isLocalHost(url.hostname) &&
-      request.headers.get("Upgrade") !== "websocket"
+      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
     ) {
       const httpsUrl = new URL(request.url);
       httpsUrl.protocol = "https:";
@@ -154,7 +157,22 @@ export default {
         );
       }
 
-      const roomKey = roomCheck.normalized ? "code:" + roomCheck.normalized : roomFromIp(ip);
+      const ipRoomKey = roomFromIp(ip);
+      // Enforce global per-IP connection rate limit across all custom rooms via the client's IP room DO
+      if (roomCheck.normalized) {
+        const ipLimiterStub = env.ROOMS.get(env.ROOMS.idFromName(ipRoomKey));
+        const ipLimitRes = await ipLimiterStub.fetch(
+          new Request("https://internal/check-ws-limit", {
+            method: "POST",
+            headers: { "X-Client-IP": ip },
+          })
+        );
+        if (ipLimitRes.status === 429) {
+          return withSecurityHeaders(new Response("Too many connection attempts", { status: 429 }), request);
+        }
+      }
+
+      const roomKey = roomCheck.normalized ? "code:" + roomCheck.normalized : ipRoomKey;
       const stub = env.ROOMS.get(env.ROOMS.idFromName(roomKey));
       return stub.fetch(request);
     }
@@ -359,6 +377,13 @@ export class Room extends DurableObject {
       return new Response(allowed ? "OK" : "Rate limit exceeded", { status: allowed ? 200 : 429 });
     }
 
+    // Internal global per-IP WebSocket connection rate-limit check across custom rooms
+    if (url.pathname === "/check-ws-limit" && request.method === "POST") {
+      const ip = sanitizeIp(request.headers.get("X-Client-IP") || "local");
+      const allowed = this.checkIpRate(this.ipConnectHistory, ip, SERVER_LIMITS.MAX_CONN_ATTEMPTS_PER_IP_PER_MIN, now);
+      return new Response(allowed ? "OK" : "Rate limit exceeded", { status: allowed ? 200 : 429 });
+    }
+
     const ip = sanitizeIp(request.headers.get("CF-Connecting-IP") || "local");
 
     // 1. Enforce per-IP connection attempt rate limit
@@ -373,14 +398,20 @@ export class Room extends DurableObject {
 
     const activeSockets = this.ctx.getWebSockets();
     const clientToken = url.searchParams.get("token") || "";
+    const clientSubnet = roomFromIp(ip);
     let resumedIdentity = null;
 
-    // 3. Check if this is a legitimate reconnect using a server-issued secret reconnectToken
+    // 3. Check if this is a legitimate reconnect using a server-issued secret reconnectToken bound to the same IP/subnet
     if (RECONNECT_TOKEN_REGEX.test(clientToken)) {
       // Check active sockets first (fast network switch before old socket closed)
       for (const old of activeSockets) {
         const att = old.deserializeAttachment();
-        if (att?.id && att.reconnectToken && timingSafeEqual(att.reconnectToken, clientToken)) {
+        if (
+          att?.id &&
+          att.reconnectToken &&
+          timingSafeEqual(att.reconnectToken, clientToken) &&
+          roomFromIp(att.ip || "local") === clientSubnet
+        ) {
           resumedIdentity = { id: att.id, name: att.name };
           old.serializeAttachment({ id: null });
           try { old.close(1000, "replaced"); } catch {}
@@ -390,23 +421,21 @@ export class Room extends DurableObject {
       // Or check recently disconnected sessions within 60s TTL
       if (!resumedIdentity) {
         const cached = this.reconnectCache.get(clientToken);
-        if (cached && now <= cached.expiresAt) {
+        if (cached && now <= cached.expiresAt && roomFromIp(cached.ip || "local") === clientSubnet) {
           resumedIdentity = { id: cached.id, name: cached.name };
           this.reconnectCache.delete(clientToken);
         }
       }
     }
 
-    // 4. Enforce room capacity and per-IP active connection limits
+    // 4. Enforce room capacity and per-IP active connection limits (even on reconnect, after replacing old socket)
     const currentValidSockets = this.ctx.getWebSockets().filter((s) => s.deserializeAttachment()?.id);
-    if (!resumedIdentity) {
-      if (currentValidSockets.length >= SERVER_LIMITS.MAX_PEERS_PER_ROOM) {
-        return withSecurityHeaders(new Response("Room is full", { status: 503 }), request);
-      }
-      const sameIpCount = currentValidSockets.filter((s) => s.deserializeAttachment()?.ip === ip).length;
-      if (sameIpCount >= SERVER_LIMITS.MAX_CONNS_PER_IP) {
-        return withSecurityHeaders(new Response("Too many connections from this IP", { status: 429 }), request);
-      }
+    if (currentValidSockets.length >= SERVER_LIMITS.MAX_PEERS_PER_ROOM) {
+      return withSecurityHeaders(new Response("Room is full", { status: 503 }), request);
+    }
+    const sameIpCount = currentValidSockets.filter((s) => s.deserializeAttachment()?.ip === ip).length;
+    if (sameIpCount >= SERVER_LIMITS.MAX_CONNS_PER_IP) {
+      return withSecurityHeaders(new Response("Too many connections from this IP", { status: 429 }), request);
     }
 
     // 5. Generate server-controlled identity using CSPRNG
@@ -598,6 +627,12 @@ export class Room extends DurableObject {
     if (att?.id) {
       this.rateState.delete(att.id);
       if (att.reconnectToken) {
+        // Bound reconnectCache size to prevent memory exhaustion from rapid connect/disconnect floods
+        while (this.reconnectCache.size >= SERVER_LIMITS.MAX_RECONNECT_CACHE_SIZE) {
+          const oldestKey = this.reconnectCache.keys().next().value;
+          if (!oldestKey) break;
+          this.reconnectCache.delete(oldestKey);
+        }
         this.reconnectCache.set(att.reconnectToken, {
           id: att.id,
           name: att.name,
@@ -771,11 +806,17 @@ function timingSafeEqual(a, b) {
   return diff === 0;
 }
 
-// Cryptographically secure display name generator
+// Cryptographically secure display name generator using rejection sampling (zero modulo bias)
 function cryptoRandomIndex(max) {
+  if (!Number.isSafeInteger(max) || max <= 1) return 0;
   const buf = new Uint32Array(1);
-  crypto.getRandomValues(buf);
-  return buf[0] % max;
+  const limit = Math.floor(0x100000000 / max) * max;
+  let val;
+  do {
+    crypto.getRandomValues(buf);
+    val = buf[0];
+  } while (val >= limit);
+  return val % max;
 }
 
 export function randomName() {
