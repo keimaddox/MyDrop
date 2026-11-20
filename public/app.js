@@ -11,7 +11,15 @@ const iceReady = fetch("/ice")
 
 const MAX_BUFFER = 2 * 1024 * 1024; // WebRTC bufferedAmount high watermark (2MB)
 const MAX_WS_BUFFER = 1024 * 1024;  // WebSocket bufferedAmount high watermark (1MB)
-const MAX_IN_FLIGHT_CHUNKS = 16;    // Sliding window flow control (max unacknowledged chunks)
+const MAX_IN_FLIGHT_CHUNKS = 16;    // Initial sliding window flow control (max unacknowledged chunks)
+const MIN_IN_FLIGHT_CHUNKS = 6;     // Minimum adaptive sliding window
+const MAX_MOBILE_IN_FLIGHT_CHUNKS = 20;
+const MAX_DESKTOP_IN_FLIGHT_CHUNKS = 32;
+const MAX_MOBILE_IN_FLIGHT_BYTES = 1024 * 1024;       // 1 MB in-flight memory budget on mobile devices
+const MAX_DESKTOP_IN_FLIGHT_BYTES = 2 * 1024 * 1024;  // 2 MB in-flight memory budget on desktop devices
+const RELAY_SERVER_MAX_MSG_PER_SEC = 160;             // Matches server MAX_MESSAGES_PER_SECOND
+const RELAY_SAFE_MSG_PER_SEC = 140;                   // Client-side Relay ceiling to prevent 1008 disconnect
+const RELAY_BURST_ALLOWANCE = 16;                     // Initial burst per 1s window before pacing kicks in
 const ACK_BATCH_INTERVAL = 4;       // Receiver sends cumulative ACK every 4 chunks (or on final chunk)
 const MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024; // 4 GB streaming file support
 const MAX_TRANSFER_SIZE = 8 * 1024 * 1024 * 1024; // 8 GB total transfer support
@@ -67,6 +75,181 @@ const peerProgress = new Map();      // peerId -> { ratio, label }
 const requestQueue = [];
 let activeRequest = null;
 let activeUiTransfer = null;         // { transferId, peerId, direction: 'send'|'recv' }
+const transferDiagnosticsHistory = new Map(); // transferId -> latest diagnostics snapshot
+const adaptiveTransportConfig = {
+  p2pChunkSize: 0,
+  relayChunkSize: 48 * 1024,
+  p2pWindowSize: MAX_IN_FLIGHT_CHUNKS,
+  relayWindowSize: MAX_IN_FLIGHT_CHUNKS,
+};
+
+function nowMs() {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function isMobilePlatform() {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent || "" : "";
+  return /iPhone|iPad|iPod|Android|Mobile/i.test(ua);
+}
+
+function getMaxInFlightMemoryBytes() {
+  return isMobilePlatform() ? MAX_MOBILE_IN_FLIGHT_BYTES : MAX_DESKTOP_IN_FLIGHT_BYTES;
+}
+
+// Per-connection message rate & Relay pacing state
+const wsRateState = {
+  txTimestamps: [],
+  rxTimestamps: [],
+  bucketSec: 0,
+  bucketCount: 0,
+  lastRelaySendAt: 0,
+  peakTxMsgPerSec: 0,
+  peakRxMsgPerSec: 0,
+  rateLimitHits: 0,
+  rateLimitThrottles: 0,
+  totalRatePaceWaitMs: 0,
+};
+
+function pruneRateTimestamps(arr, now = Date.now()) {
+  const cutoff = now - 1000;
+  while (arr.length > 0 && arr[0] <= cutoff) {
+    arr.shift();
+  }
+  return arr.length;
+}
+
+function recordOutgoingMessage(mode = "relay", metrics = null) {
+  const now = Date.now();
+  const txRate = pruneRateTimestamps(wsRateState.txTimestamps, now) + 1;
+  wsRateState.txTimestamps.push(now);
+  if (txRate > wsRateState.peakTxMsgPerSec) wsRateState.peakTxMsgPerSec = txRate;
+
+  if (mode === "relay") {
+    const sec = Math.floor(now / 1000);
+    if (wsRateState.bucketSec !== sec) {
+      wsRateState.bucketSec = sec;
+      wsRateState.bucketCount = 0;
+    }
+    wsRateState.bucketCount += 1;
+    wsRateState.lastRelaySendAt = nowMs();
+  }
+
+  if (metrics) {
+    metrics.txMsgPerSec = txRate;
+    if (txRate > metrics.peakTxMsgPerSec) metrics.peakTxMsgPerSec = txRate;
+  }
+  return txRate;
+}
+
+function recordIncomingMessage(mode = "relay", metrics = null) {
+  const now = Date.now();
+  const rxRate = pruneRateTimestamps(wsRateState.rxTimestamps, now) + 1;
+  wsRateState.rxTimestamps.push(now);
+  if (rxRate > wsRateState.peakRxMsgPerSec) wsRateState.peakRxMsgPerSec = rxRate;
+
+  if (metrics) {
+    metrics.rxMsgPerSec = rxRate;
+    if (rxRate > metrics.peakRxMsgPerSec) metrics.peakRxMsgPerSec = rxRate;
+  }
+  return rxRate;
+}
+
+async function waitForRelayRateLimit(metrics = null) {
+  const now = Date.now();
+  const sec = Math.floor(now / 1000);
+  if (wsRateState.bucketSec !== sec) {
+    wsRateState.bucketSec = sec;
+    wsRateState.bucketCount = 0;
+  }
+
+  let waitedMs = 0;
+  // 1) Hard ceiling guard before hitting server's 160 msg/sec disconnect
+  if (wsRateState.bucketCount >= RELAY_SAFE_MSG_PER_SEC) {
+    const waitToNextSec = Math.max(5, 1000 - (now % 1000) + 4);
+    const t0 = nowMs();
+    await new Promise((r) => setTimeout(r, waitToNextSec));
+    const dt = nowMs() - t0;
+    waitedMs += dt;
+    wsRateState.rateLimitHits += 1;
+    wsRateState.rateLimitThrottles += 1;
+    wsRateState.totalRatePaceWaitMs += dt;
+    if (metrics) {
+      metrics.rateLimitHits += 1;
+      metrics.rateLimitThrottles += 1;
+      metrics.ratePaceWaitMs += dt;
+    }
+    const afterNow = Date.now();
+    wsRateState.bucketSec = Math.floor(afterNow / 1000);
+    wsRateState.bucketCount = 0;
+  } else if (wsRateState.bucketCount >= RELAY_BURST_ALLOWANCE) {
+    // 2) Smooth pacing after initial burst so continuous streaming stays under 140 msg/s
+    const minIntervalMs = Math.ceil(1000 / RELAY_SAFE_MSG_PER_SEC);
+    const sinceLast = nowMs() - wsRateState.lastRelaySendAt;
+    if (sinceLast < minIntervalMs) {
+      const delay = Math.max(1, Math.ceil(minIntervalMs - sinceLast));
+      const t0 = nowMs();
+      await new Promise((r) => setTimeout(r, delay));
+      const dt = nowMs() - t0;
+      waitedMs += dt;
+      wsRateState.rateLimitThrottles += 1;
+      wsRateState.totalRatePaceWaitMs += dt;
+      if (metrics) {
+        metrics.rateLimitThrottles += 1;
+        metrics.ratePaceWaitMs += dt;
+      }
+    }
+  }
+  return waitedMs;
+}
+
+function createTransferMetrics(mode = "relay", chunkSize = 48 * 1024, windowSize = MAX_IN_FLIGHT_CHUNKS) {
+  return {
+    mode,
+    chunkSize,
+    recommendedChunkSize: chunkSize,
+    windowSize,
+    inFlightChunks: 0,
+    maxInFlightBytes: getMaxInFlightMemoryBytes(),
+    isMobile: isMobilePlatform(),
+    sendSpeedBps: 0,
+    recvSpeedBps: 0,
+    avgReadMs: 0,
+    avgEncryptMs: 0,
+    avgSendMs: 0,
+    avgDecryptMs: 0,
+    avgWriteMs: 0,
+    totalReadMs: 0,
+    totalEncryptMs: 0,
+    totalSendMs: 0,
+    totalDecryptMs: 0,
+    totalWriteMs: 0,
+    chunksMeasured: 0,
+    chunksDecrypted: 0,
+    bufferedAmount: 0,
+    maxBufferedAmount: 0,
+    bufferWaitMs: 0,
+    bufferWaitCount: 0,
+    ackWaitMs: 0,
+    ackWaitCount: 0,
+    txMsgPerSec: 0,
+    rxMsgPerSec: 0,
+    peakTxMsgPerSec: 0,
+    peakRxMsgPerSec: 0,
+    rateLimitHits: 0,
+    rateLimitThrottles: 0,
+    ratePaceWaitMs: 0,
+    bottleneckCode: "analyzing",
+    bottleneckLabel: "กำลังรวบรวมสถิติการส่ง...",
+    tuningAction: "เริ่มต้นด้วยค่ามาตรฐาน",
+  };
+}
+
+function updateEma(currentAvg, sample, count) {
+  if (count <= 1 || currentAvg === 0) return sample;
+  return currentAvg * 0.75 + sample * 0.25;
+}
 
 // ================= E2EE State & Web Crypto Primitives =================
 // E2EE is integrated directly with the chunk streaming protocol so Relay never sees plaintext.
@@ -74,6 +257,9 @@ const e2eeSessions = new Map();
 
 function bufToBase64(buf) {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  if (typeof bytes.toBase64 === "function") {
+    return bytes.toBase64();
+  }
   let bin = "";
   for (let i = 0; i < bytes.length; i += 8192) {
     bin += String.fromCharCode(...bytes.subarray(i, i + 8192));
@@ -82,6 +268,9 @@ function bufToBase64(buf) {
 }
 
 function base64ToBuf(b64) {
+  if (typeof Uint8Array.fromBase64 === "function") {
+    return Uint8Array.fromBase64(b64).buffer;
+  }
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
@@ -747,6 +936,242 @@ function formatEta(seconds) {
   return `ETA: ${m}m ${remS}s`;
 }
 
+function formatMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "0.00 ms";
+  if (ms < 10) return `${ms.toFixed(2)} ms`;
+  if (ms < 100) return `${ms.toFixed(1)} ms`;
+  return `${Math.round(ms)} ms`;
+}
+
+function computeOptimalP2PChunkSize(peerId, boostForCryptoOrAck = false) {
+  const c = conns.get(peerId);
+  const maxSctp = c?.pc?.sctp?.maxMessageSize || 65536;
+  // Base64 + JSON envelope adds ~34% overhead; keep raw chunk safely within SCTP maxMessageSize and Relay 120KB B64 fallback limit
+  const safeSctpRaw = Math.floor((maxSctp - 512) * 0.72);
+  const mobileCap = isMobilePlatform() ? 48 * 1024 : 64 * 1024;
+  const target = boostForCryptoOrAck ? mobileCap : Math.min(48 * 1024, mobileCap);
+  const aligned = Math.floor(Math.min(target, safeSctpRaw, 64 * 1024) / 1024) * 1024;
+  return Math.max(16 * 1024, aligned || 32768);
+}
+
+function evaluateBottleneckAndTune(state, tx = null) {
+  if (!state || !state.metrics) return null;
+  const m = state.metrics;
+  const mode = tx?.mode || m.mode || "relay";
+  m.mode = mode;
+
+  const isMobile = isMobilePlatform();
+  m.isMobile = isMobile;
+  const maxMemBytes = getMaxInFlightMemoryBytes();
+  m.maxInFlightBytes = maxMemBytes;
+  const hardMaxWindow = isMobile ? MAX_MOBILE_IN_FLIGHT_CHUNKS : MAX_DESKTOP_IN_FLIGHT_CHUNKS;
+  const maxWindowForMem = Math.max(
+    MIN_IN_FLIGHT_CHUNKS,
+    Math.min(hardMaxWindow, Math.floor(maxMemBytes / Math.max(1024, state.chunkSize)))
+  );
+
+  if (tx?.getBufferedAmount) {
+    const curBuf = tx.getBufferedAmount();
+    m.bufferedAmount = curBuf;
+    if (curBuf > m.maxBufferedAmount) m.maxBufferedAmount = curBuf;
+  }
+
+  const chunks = Math.max(1, m.chunksMeasured);
+  const avgBufWait = m.bufferWaitMs / chunks;
+  const avgAckWait = m.ackWaitMs / chunks;
+  const cryptoCost = m.avgEncryptMs + m.avgDecryptMs;
+  const writeCost = m.avgWriteMs;
+
+  if (mode === "relay") {
+    // Relay: ตรวจ rate limit และจังหวะส่งก่อน
+    const nearRateLimit =
+      m.rateLimitHits > 0 ||
+      m.rateLimitThrottles > 0 ||
+      m.ratePaceWaitMs > 0 ||
+      m.txMsgPerSec >= RELAY_SAFE_MSG_PER_SEC * 0.8;
+
+    if (nearRateLimit) {
+      m.bottleneckCode = "relay-rate-limit";
+      m.bottleneckLabel = `Relay: คุมจังหวะส่งตามเพดาน Rate Limit (${m.txMsgPerSec}/${RELAY_SERVER_MAX_MSG_PER_SEC} msg/s)`;
+      const tunedWindow = Math.max(MIN_IN_FLIGHT_CHUNKS, Math.min(state.windowSize, 12, maxWindowForMem));
+      const tunedChunk = isMobile ? 48 * 1024 : 64 * 1024;
+      state.windowSize = tunedWindow;
+      m.windowSize = tunedWindow;
+      m.recommendedChunkSize = tunedChunk;
+      adaptiveTransportConfig.relayWindowSize = tunedWindow;
+      adaptiveTransportConfig.relayChunkSize = tunedChunk;
+      m.tuningAction = `คุมจังหวะส่ง ~${Math.ceil(1000 / RELAY_SAFE_MSG_PER_SEC)} ms/msg, ปรับ Window=${tunedWindow} chunks, Chunk แนะนำ=${formatSize(tunedChunk)} (RAM cap ${formatSize(maxMemBytes)})`;
+    } else if (m.bufferWaitCount > 0 || m.bufferedAmount > MAX_WS_BUFFER * 0.7) {
+      m.bottleneckCode = "relay-ws-buffer";
+      m.bottleneckLabel = "Relay: หน่วงจาก WebSocket bufferedAmount Backpressure";
+      const tunedWindow = Math.max(MIN_IN_FLIGHT_CHUNKS, Math.min(maxWindowForMem, state.windowSize - 2));
+      state.windowSize = tunedWindow;
+      m.windowSize = tunedWindow;
+      adaptiveTransportConfig.relayWindowSize = tunedWindow;
+      m.tuningAction = `ลดหน้าต่างส่งเป็น ${tunedWindow} chunks เพื่อลดการค้างใน WebSocket buffer`;
+    } else if (m.ackWaitCount > 0 && avgAckWait > 0.5) {
+      m.bottleneckCode = "relay-ack-latency";
+      m.bottleneckLabel = "Relay: รอ ACK ตามค่า RTT เครือข่าย";
+      const tunedWindow = Math.min(maxWindowForMem, state.windowSize + 2);
+      state.windowSize = tunedWindow;
+      m.windowSize = tunedWindow;
+      adaptiveTransportConfig.relayWindowSize = tunedWindow;
+      m.tuningAction = `ขยายหน้าต่างส่งเป็น ${tunedWindow} chunks ชดเชย RTT (จำกัด RAM ${formatSize(maxMemBytes)})`;
+    } else {
+      m.bottleneckCode = "relay-balanced";
+      m.bottleneckLabel = "Relay: จังหวะส่งสมดุล (ไม่ชน Rate Limit)";
+      m.windowSize = Math.min(state.windowSize, maxWindowForMem);
+      state.windowSize = m.windowSize;
+      m.tuningAction = `คง Chunk=${formatSize(state.chunkSize)}, Window=${state.windowSize} chunks (E2EE + RAM cap ${formatSize(maxMemBytes)})`;
+    }
+  } else {
+    // P2P: ดูว่า DataChannel ถูกหน่วงจาก buffer, ACK หรือการเข้ารหัส/เขียนไฟล์
+    const bufStalled = m.bufferWaitCount > 0 || m.bufferedAmount > MAX_BUFFER * 0.7 || avgBufWait > 0.5;
+    const writeStalled = writeCost > 2.0 && writeCost >= cryptoCost && (m.ackWaitCount > 0 || writeCost > avgAckWait);
+    const cryptoStalled = cryptoCost > 1.5 && cryptoCost > avgAckWait && cryptoCost > writeCost;
+    const ackStalled = m.ackWaitCount > 0 || avgAckWait > 0.4;
+
+    if (bufStalled) {
+      m.bottleneckCode = "p2p-buffer";
+      m.bottleneckLabel = "P2P: DataChannel ถูกหน่วงจาก bufferedAmount Backpressure";
+      const tunedWindow = Math.max(MIN_IN_FLIGHT_CHUNKS, Math.min(maxWindowForMem, state.windowSize - 4));
+      state.windowSize = tunedWindow;
+      m.windowSize = tunedWindow;
+      adaptiveTransportConfig.p2pWindowSize = tunedWindow;
+      m.tuningAction = `ลดหน้าต่างส่งเหลือ ${tunedWindow} chunks เพื่อระบาย DataChannel buffer`;
+    } else if (writeStalled) {
+      m.bottleneckCode = "p2p-storage-write";
+      m.bottleneckLabel = `P2P: DataChannel ถูกหน่วงจากการเขียนไฟล์ลงเครื่องฝั่งรับ (${formatMs(writeCost)}/chunk)`;
+      const safeWriteWindow = Math.max(MIN_IN_FLIGHT_CHUNKS, Math.min(state.windowSize, isMobile ? 10 : 16, maxWindowForMem));
+      state.windowSize = safeWriteWindow;
+      m.windowSize = safeWriteWindow;
+      adaptiveTransportConfig.p2pWindowSize = safeWriteWindow;
+      m.tuningAction = `คุม Window=${safeWriteWindow} chunks ป้องกันคิวเขียนไฟล์สะสมใน RAM บนมือถือ`;
+    } else if (cryptoStalled) {
+      m.bottleneckCode = "p2p-crypto";
+      m.bottleneckLabel = `P2P: DataChannel ถูกหน่วงจากการเข้ารหัส/ถอดรหัส E2EE (${formatMs(cryptoCost)}/chunk)`;
+      const boostedChunk = computeOptimalP2PChunkSize(state.peerId, true);
+      const tunedWindow = Math.max(
+        MIN_IN_FLIGHT_CHUNKS,
+        Math.min(maxWindowForMem, Math.floor(maxMemBytes / boostedChunk))
+      );
+      state.windowSize = tunedWindow;
+      m.windowSize = tunedWindow;
+      m.recommendedChunkSize = boostedChunk;
+      adaptiveTransportConfig.p2pChunkSize = boostedChunk;
+      adaptiveTransportConfig.p2pWindowSize = tunedWindow;
+      if (tx && tx.mode === "p2p") tx.chunk = boostedChunk;
+      m.tuningAction = `ปรับเพิ่ม P2P Chunk เป็น ${formatSize(boostedChunk)}, Window=${tunedWindow} chunks เพื่อลด overhead เข้ารหัสต่อก้อน`;
+    } else if (ackStalled) {
+      m.bottleneckCode = "p2p-ack-window";
+      m.bottleneckLabel = `P2P: DataChannel ถูกหน่วงจากการรอ ACK (${formatMs(m.ackWaitMs)} สะสม)`;
+      const boostedChunk = computeOptimalP2PChunkSize(state.peerId, true);
+      const maxWinForBoost = Math.max(
+        MIN_IN_FLIGHT_CHUNKS,
+        Math.min(hardMaxWindow, Math.floor(maxMemBytes / Math.max(state.chunkSize, boostedChunk)))
+      );
+      const tunedWindow = Math.min(maxWinForBoost, state.windowSize + 4);
+      state.windowSize = tunedWindow;
+      m.windowSize = tunedWindow;
+      m.recommendedChunkSize = boostedChunk;
+      adaptiveTransportConfig.p2pChunkSize = boostedChunk;
+      adaptiveTransportConfig.p2pWindowSize = tunedWindow;
+      if (tx && tx.mode === "p2p") tx.chunk = boostedChunk;
+      m.tuningAction = `ขยาย Window เป็น ${tunedWindow} chunks และ Chunk=${formatSize(boostedChunk)} (จำกัด RAM ${formatSize(maxMemBytes)})`;
+    } else {
+      m.bottleneckCode = "p2p-optimal";
+      m.bottleneckLabel = "P2P: สตรีมผ่าน DataChannel ราบรื่น (ไม่ติดคอขวด)";
+      m.windowSize = Math.min(state.windowSize, maxWindowForMem);
+      state.windowSize = m.windowSize;
+      m.tuningAction = `คง Chunk=${formatSize(state.chunkSize)}, Window=${state.windowSize} chunks (E2EE + RAM cap ${formatSize(maxMemBytes)})`;
+    }
+  }
+
+  return m;
+}
+
+function getTransferDiagnostics(transferId = activeUiTransfer?.transferId) {
+  if (transferId && outgoingTransfers.has(transferId)) {
+    const out = outgoingTransfers.get(transferId);
+    const snap = buildDiagnosticsSnapshot("send", out.transferId, out.peerId, out.metrics, out);
+    transferDiagnosticsHistory.set(transferId, snap);
+    return snap;
+  }
+  for (const [peerId, inc] of incoming.entries()) {
+    if (!transferId || inc.meta?.transferId === transferId) {
+      const tid = inc.meta?.transferId || transferId || "";
+      const snap = buildDiagnosticsSnapshot("recv", tid, peerId, inc.metrics, inc);
+      if (tid) transferDiagnosticsHistory.set(tid, snap);
+      return snap;
+    }
+  }
+  if (transferId && transferDiagnosticsHistory.has(transferId)) {
+    return transferDiagnosticsHistory.get(transferId);
+  }
+  if (transferDiagnosticsHistory.size > 0) {
+    const keys = [...transferDiagnosticsHistory.keys()];
+    return transferDiagnosticsHistory.get(keys[keys.length - 1]);
+  }
+  return null;
+}
+
+function buildDiagnosticsSnapshot(direction, transferId, peerId, metrics, rawState) {
+  const m = metrics || createTransferMetrics();
+  return {
+    transferId,
+    peerId,
+    direction,
+    mode: m.mode,
+    modeDisplay: m.mode === "p2p" ? "P2P (WebRTC DataChannel E2EE)" : "Relay (WebSocket E2EE)",
+    sendSpeedBps: m.sendSpeedBps,
+    recvSpeedBps: m.recvSpeedBps,
+    timings: {
+      readMs: m.avgReadMs,
+      encryptMs: m.avgEncryptMs,
+      sendMs: m.avgSendMs,
+      decryptMs: m.avgDecryptMs,
+      writeMs: m.avgWriteMs,
+      totalReadMs: m.totalReadMs,
+      totalEncryptMs: m.totalEncryptMs,
+      totalSendMs: m.totalSendMs,
+      totalDecryptMs: m.totalDecryptMs,
+      totalWriteMs: m.totalWriteMs,
+    },
+    buffer: {
+      bufferedAmount: m.bufferedAmount,
+      maxBufferedAmount: m.maxBufferedAmount,
+      bufferWaitMs: m.bufferWaitMs,
+      bufferWaitCount: m.bufferWaitCount,
+      ackWaitMs: m.ackWaitMs,
+      ackWaitCount: m.ackWaitCount,
+      inFlightChunks: m.inFlightChunks,
+      windowSize: m.windowSize,
+    },
+    rate: {
+      txMsgPerSec: m.txMsgPerSec,
+      rxMsgPerSec: m.rxMsgPerSec,
+      peakTxMsgPerSec: m.peakTxMsgPerSec,
+      peakRxMsgPerSec: m.peakRxMsgPerSec,
+      rateLimitHits: m.rateLimitHits,
+      rateLimitThrottles: m.rateLimitThrottles,
+      ratePaceWaitMs: m.ratePaceWaitMs,
+    },
+    tuning: {
+      bottleneckCode: m.bottleneckCode,
+      bottleneckLabel: m.bottleneckLabel,
+      tuningAction: m.tuningAction,
+      chunkSize: m.chunkSize,
+      recommendedChunkSize: m.recommendedChunkSize,
+      windowSize: m.windowSize,
+      maxInFlightBytes: m.maxInFlightBytes,
+      isMobile: m.isMobile,
+      e2eeActive: true,
+    },
+    transferredBytes: direction === "send" ? (rawState?.sentBytes || 0) : (rawState?.received || 0),
+    ackedBytes: direction === "send" ? (rawState?.ackedBytes || 0) : (rawState?.received || 0),
+  };
+}
+
 function updateTransferPanel({
   transferId,
   peerId,
@@ -759,6 +1184,7 @@ function updateTransferPanel({
   paused = false,
   storageNote = "",
   errorText = "",
+  metrics = null,
 }) {
   activeUiTransfer = { transferId, peerId, direction };
   const panel = $("#transferPanel");
@@ -772,12 +1198,71 @@ function updateTransferPanel({
   const remainingBytes = Math.max(0, totalBytes - transferredBytes);
   const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Infinity;
 
+  const outState = transferId ? outgoingTransfers.get(transferId) : null;
+  const incState = peerId ? incoming.get(peerId) : null;
+  const m = metrics || (direction === "send" ? outState?.metrics : incState?.metrics) || null;
+
+  if (m) {
+    if (direction === "send") {
+      m.sendSpeedBps = bytesPerSec;
+      const acked = outState?.ackedBytes > 0 ? outState.ackedBytes : transferredBytes;
+      m.recvSpeedBps = acked / elapsedSec;
+    } else {
+      m.recvSpeedBps = bytesPerSec;
+      const wireBytes = incState?.wireReceivedBytes > 0 ? incState.wireReceivedBytes : transferredBytes;
+      if (!m.sendSpeedBps || wireBytes >= transferredBytes) {
+        m.sendSpeedBps = wireBytes / elapsedSec;
+      }
+    }
+    const rawState = direction === "send" ? outState : incState;
+    if (transferId) {
+      transferDiagnosticsHistory.set(
+        transferId,
+        buildDiagnosticsSnapshot(direction, transferId, peerId, m, rawState)
+      );
+    }
+  }
+
   $("#tpTitle").textContent = title || (direction === "send" ? "กำลังส่งไฟล์..." : "กำลังรับไฟล์...");
   $("#tpStateBadge").textContent = stateLabel || (paused ? "หยุดชั่วคราว" : "กำลังสตรีม (E2EE)");
   $("#tpBar").style.width = `${pct}%`;
   $("#tpSizeInfo").textContent = `${formatSize(transferredBytes)} / ${formatSize(totalBytes)} (${pct}%)`;
-  $("#tpSpeedInfo").textContent = paused ? "0 B/s (Paused)" : `${formatSize(bytesPerSec)}/s`;
+  $("#tpSpeedInfo").textContent = paused
+    ? "0 B/s (Paused)"
+    : m
+    ? `ส่ง: ${formatSize(m.sendSpeedBps)}/s | รับ: ${formatSize(m.recvSpeedBps)}/s`
+    : `${formatSize(bytesPerSec)}/s`;
   $("#tpEtaInfo").textContent = paused ? "ETA: หยุดชั่วคราว" : formatEta(etaSec);
+
+  if (m) {
+    const modeName = m.mode === "p2p" ? "P2P (WebRTC DataChannel)" : "Relay (WebSocket)";
+    const diagModeEl = $("#tpDiagMode");
+    if (diagModeEl) {
+      diagModeEl.textContent = `${modeName} | Chunk: ${formatSize(m.chunkSize)} (แนะนำ ${formatSize(m.recommendedChunkSize)}) | Window: ${m.windowSize} chunks (ค้าง ${m.inFlightChunks})`;
+    }
+    const diagSpeedsEl = $("#tpDiagSpeeds");
+    if (diagSpeedsEl) {
+      diagSpeedsEl.textContent = paused
+        ? "หยุดชั่วคราว (Paused)"
+        : `ความเร็วส่ง (Tx): ${formatSize(m.sendSpeedBps)}/s | ความเร็วรับ (Rx): ${formatSize(m.recvSpeedBps)}/s`;
+    }
+    const diagTimingsEl = $("#tpDiagTimings");
+    if (diagTimingsEl) {
+      diagTimingsEl.textContent = `อ่าน: ${formatMs(m.avgReadMs)} | เข้ารหัส: ${formatMs(m.avgEncryptMs)} | ส่ง: ${formatMs(m.avgSendMs)} | ถอดรหัส: ${formatMs(m.avgDecryptMs)} | เขียน: ${formatMs(m.avgWriteMs)}`;
+    }
+    const diagBufferEl = $("#tpDiagBuffer");
+    if (diagBufferEl) {
+      diagBufferEl.textContent = `bufferedAmount: ${formatSize(m.bufferedAmount)} (สูงสุด ${formatSize(m.maxBufferedAmount)}) | รอ Buffer: ${formatMs(m.bufferWaitMs)} (${m.bufferWaitCount} ครั้ง) | รอ ACK: ${formatMs(m.ackWaitMs)} (${m.ackWaitCount} ครั้ง)`;
+    }
+    const diagRateEl = $("#tpDiagRate");
+    if (diagRateEl) {
+      diagRateEl.textContent = `Tx: ${m.txMsgPerSec} msg/s (สูงสุด ${m.peakTxMsgPerSec}) | Rx: ${m.rxMsgPerSec} msg/s | ชน Rate Limit: ${m.rateLimitHits} ครั้ง | ชะลอจังหวะ: ${m.rateLimitThrottles} ครั้ง (${formatMs(m.ratePaceWaitMs)})`;
+    }
+    const diagBottleneckEl = $("#tpDiagBottleneck");
+    if (diagBottleneckEl) {
+      diagBottleneckEl.textContent = `${m.bottleneckLabel} → ${m.tuningAction}`;
+    }
+  }
 
   const noteEl = $("#tpStorageNote");
   if (noteEl) noteEl.textContent = storageNote || detectStorageCapabilities().note;
@@ -1093,11 +1578,21 @@ function connectWS() {
     } else if (msg.type === "signal") {
       onSignal(msg.from, msg.data);
     } else if (msg.type === "relay") {
-      onEncryptedEnvelope(msg.from, msg.data);
+      recordIncomingMessage("relay");
+      onEncryptedEnvelope(msg.from, msg.data, "relay");
     }
   };
-  socket.onclose = () => {
+  socket.onclose = (ev) => {
     if (ws !== socket) return;
+    if (ev?.code === 1008 || /rate limit/i.test(ev?.reason || "")) {
+      wsRateState.rateLimitHits += 1;
+      for (const out of outgoingTransfers.values()) {
+        if (out.metrics) {
+          out.metrics.rateLimitHits += 1;
+          evaluateBottleneckAndTune(out);
+        }
+      }
+    }
     if (manualClose) {
       manualClose = false;
       return;
@@ -1166,8 +1661,9 @@ function signal(to, data) {
   }
 }
 
-function relaySend(to, data) {
+function relaySend(to, data, metrics = null) {
   if (ws?.readyState !== 1) throw new Error("ws closed");
+  recordOutgoingMessage("relay", metrics);
   ws.send(JSON.stringify({ type: "relay", to, data }));
 }
 
@@ -1230,7 +1726,8 @@ function setupChannel(c, peerId, dc) {
   dc.onmessage = (e) => {
     if (typeof e.data === "string") {
       try {
-        onEncryptedEnvelope(peerId, JSON.parse(e.data));
+        recordIncomingMessage("p2p");
+        onEncryptedEnvelope(peerId, JSON.parse(e.data), "p2p");
       } catch {}
     }
   };
@@ -1287,13 +1784,21 @@ async function connect(peerId) {
     closeConn(peerId);
     throw err;
   }
-  c.chunk = Math.min(48 * 1024, c.pc.sctp?.maxMessageSize ? Math.floor(c.pc.sctp.maxMessageSize * 0.65) : 32768);
+  c.chunk = adaptiveTransportConfig.p2pChunkSize > 0
+    ? Math.min(adaptiveTransportConfig.p2pChunkSize, computeOptimalP2PChunkSize(peerId, true))
+    : computeOptimalP2PChunkSize(peerId, false);
   return c;
 }
 
-// Drain WebRTC DataChannel or WebSocket buffer with explicit backpressure
-async function waitForChannelDrain(dc) {
-  if (dc.bufferedAmount <= MAX_BUFFER) return;
+// Drain WebRTC DataChannel or WebSocket buffer with explicit backpressure & wait time tracking
+async function waitForChannelDrain(dc, metrics = null) {
+  const curBuf = dc?.bufferedAmount || 0;
+  if (metrics) {
+    metrics.bufferedAmount = curBuf;
+    if (curBuf > metrics.maxBufferedAmount) metrics.maxBufferedAmount = curBuf;
+  }
+  if (curBuf <= MAX_BUFFER) return 0;
+  const t0 = nowMs();
   await new Promise((resolve) => {
     let resolved = false;
     const done = () => {
@@ -1310,12 +1815,33 @@ async function waitForChannelDrain(dc) {
       }
     }, 15);
   });
+  const waited = nowMs() - t0;
+  if (metrics) {
+    metrics.bufferWaitMs += waited;
+    metrics.bufferWaitCount += 1;
+    metrics.bufferedAmount = dc?.bufferedAmount || 0;
+  }
+  return waited;
 }
 
-async function waitForWsDrain(socket) {
+async function waitForWsDrain(socket, metrics = null) {
+  const curBuf = socket?.bufferedAmount || 0;
+  if (metrics) {
+    metrics.bufferedAmount = curBuf;
+    if (curBuf > metrics.maxBufferedAmount) metrics.maxBufferedAmount = curBuf;
+  }
+  if (!socket || socket.readyState !== 1 || curBuf <= MAX_WS_BUFFER) return 0;
+  const t0 = nowMs();
   while (socket?.readyState === 1 && socket.bufferedAmount > MAX_WS_BUFFER) {
     await new Promise((r) => setTimeout(r, 15));
   }
+  const waited = nowMs() - t0;
+  if (metrics) {
+    metrics.bufferWaitMs += waited;
+    metrics.bufferWaitCount += 1;
+    metrics.bufferedAmount = socket?.bufferedAmount || 0;
+  }
+  return waited;
 }
 
 async function getTransport(peerId) {
@@ -1326,16 +1852,30 @@ async function getTransport(peerId) {
     return {
       mode: "p2p",
       chunk: c.chunk,
+      windowSize: adaptiveTransportConfig.p2pWindowSize || MAX_IN_FLIGHT_CHUNKS,
       isOpen: () => c.dc?.readyState === "open",
       getBufferedAmount: () => c.dc?.bufferedAmount || 0,
-      async sendControl(plainObj) {
+      async sendControl(plainObj, metrics = null) {
         const envMsg = await encryptControlMessage(peerId, plainObj);
+        recordOutgoingMessage("p2p", metrics);
         c.dc.send(JSON.stringify(envMsg));
       },
-      async sendChunk(transferId, fileIndex, seq, plainBuf) {
-        await waitForChannelDrain(c.dc);
+      async sendChunk(transferId, fileIndex, seq, plainBuf, metrics = null) {
+        await waitForChannelDrain(c.dc, metrics);
+        const tEnc0 = nowMs();
         const envMsg = await encryptFileChunk(peerId, transferId, fileIndex, seq, plainBuf);
-        c.dc.send(JSON.stringify(envMsg));
+        const encryptMs = nowMs() - tEnc0;
+        const tSend0 = nowMs();
+        const rawJson = JSON.stringify(envMsg);
+        recordOutgoingMessage("p2p", metrics);
+        c.dc.send(rawJson);
+        const sendMs = nowMs() - tSend0;
+        const curBuf = c.dc?.bufferedAmount || 0;
+        if (metrics) {
+          metrics.bufferedAmount = curBuf;
+          if (curBuf > metrics.maxBufferedAmount) metrics.maxBufferedAmount = curBuf;
+        }
+        return { encryptMs, sendMs, bufferedAmount: curBuf };
       },
     };
   } catch {
@@ -1345,16 +1885,29 @@ async function getTransport(peerId) {
     return {
       mode: "relay",
       chunk: 48 * 1024,
+      windowSize: adaptiveTransportConfig.relayWindowSize || MAX_IN_FLIGHT_CHUNKS,
       isOpen: () => ws?.readyState === 1,
       getBufferedAmount: () => ws?.bufferedAmount || 0,
-      async sendControl(plainObj) {
+      async sendControl(plainObj, metrics = null) {
+        await waitForRelayRateLimit(metrics);
         const envMsg = await encryptControlMessage(peerId, plainObj);
-        relaySend(peerId, envMsg);
+        relaySend(peerId, envMsg, metrics);
       },
-      async sendChunk(transferId, fileIndex, seq, plainBuf) {
-        await waitForWsDrain(ws);
+      async sendChunk(transferId, fileIndex, seq, plainBuf, metrics = null) {
+        await waitForRelayRateLimit(metrics);
+        await waitForWsDrain(ws, metrics);
+        const tEnc0 = nowMs();
         const envMsg = await encryptFileChunk(peerId, transferId, fileIndex, seq, plainBuf);
-        relaySend(peerId, envMsg);
+        const encryptMs = nowMs() - tEnc0;
+        const tSend0 = nowMs();
+        relaySend(peerId, envMsg, metrics);
+        const sendMs = nowMs() - tSend0;
+        const curBuf = ws?.bufferedAmount || 0;
+        if (metrics) {
+          metrics.bufferedAmount = curBuf;
+          if (curBuf > metrics.maxBufferedAmount) metrics.maxBufferedAmount = curBuf;
+        }
+        return { encryptMs, sendMs, bufferedAmount: curBuf };
       },
     };
   }
@@ -1426,7 +1979,8 @@ async function onSignal(from, data) {
 }
 
 // ================= Streaming File Transfer with Flow Control, Backpressure, Pause/Cancel/Resume =================
-async function waitForFlowControl(state, maxInFlight = MAX_IN_FLIGHT_CHUNKS) {
+async function waitForFlowControl(state, maxInFlight = state?.windowSize ?? MAX_IN_FLIGHT_CHUNKS) {
+  let countedWait = false;
   while (!state.cancelled) {
     if (state.paused || state.remotePaused) {
       await new Promise((resolve) => {
@@ -1438,8 +1992,19 @@ async function waitForFlowControl(state, maxInFlight = MAX_IN_FLIGHT_CHUNKS) {
       });
       continue;
     }
+    const effectiveLimit = state?.windowSize && maxInFlight === MAX_IN_FLIGHT_CHUNKS ? state.windowSize : maxInFlight;
     const inFlight = state.nextSeq - (state.ackedSeq + 1);
-    if (inFlight < maxInFlight) return;
+    if (state.metrics) {
+      state.metrics.inFlightChunks = Math.max(0, inFlight);
+      state.metrics.windowSize = effectiveLimit;
+    }
+    if (inFlight < effectiveLimit) return;
+
+    const t0 = nowMs();
+    if (!countedWait && state.metrics) {
+      state.metrics.ackWaitCount += 1;
+      countedWait = true;
+    }
     await new Promise((resolve) => {
       let timer;
       const w = () => {
@@ -1450,6 +2015,10 @@ async function waitForFlowControl(state, maxInFlight = MAX_IN_FLIGHT_CHUNKS) {
       state.waiters.add(w);
       timer = setTimeout(w, 250);
     });
+    if (state.metrics) {
+      state.metrics.ackWaitMs += nowMs() - t0;
+      state.metrics.inFlightChunks = Math.max(0, state.nextSeq - (state.ackedSeq + 1));
+    }
   }
 }
 
@@ -1520,6 +2089,8 @@ async function sendFiles(peerId, files) {
   }
 
   const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+  const initialWindow = tx.windowSize || MAX_IN_FLIGHT_CHUNKS;
+  const metrics = createTransferMetrics(tx.mode, tx.chunk, initialWindow);
   const state = {
     transferId,
     peerId,
@@ -1529,6 +2100,8 @@ async function sendFiles(peerId, files) {
     ackedSeq: -1,
     offset: 0,
     chunkSize: tx.chunk,
+    windowSize: initialWindow,
+    metrics,
     paused: false,
     remotePaused: false,
     cancelled: false,
@@ -1539,6 +2112,7 @@ async function sendFiles(peerId, files) {
     startTime: Date.now(),
     totalBytes,
     sentBytes: 0,
+    ackedBytes: 0,
   };
   outgoingTransfers.set(transferId, state);
 
@@ -1552,6 +2126,8 @@ async function sendFiles(peerId, files) {
       state.offset = 0;
       state.fileDoneAcked = false;
       state.chunkSize = tx.chunk;
+      state.metrics.mode = tx.mode;
+      state.metrics.chunkSize = state.chunkSize;
       const totalChunks = Math.ceil(file.size / state.chunkSize);
 
       if (!tx.isOpen()) {
@@ -1559,17 +2135,23 @@ async function sendFiles(peerId, files) {
         if (!tx) return false;
       }
 
-      await tx.sendControl({
-        type: "header",
-        transferId,
-        fileIndex,
-        name: safeName,
-        size: file.size,
-        mime: file.type,
-        chunkSize: state.chunkSize,
-        totalChunks,
-      });
+      await tx.sendControl(
+        {
+          type: "header",
+          transferId,
+          fileIndex,
+          name: safeName,
+          size: file.size,
+          mime: file.type,
+          chunkSize: state.chunkSize,
+          totalChunks,
+          mode: tx.mode,
+          windowSize: state.windowSize,
+        },
+        state.metrics
+      );
 
+      evaluateBottleneckAndTune(state, tx);
       updateTransferPanel({
         transferId,
         peerId,
@@ -1580,13 +2162,14 @@ async function sendFiles(peerId, files) {
         totalBytes: state.totalBytes,
         startTime: state.startTime,
         paused: false,
+        metrics: state.metrics,
       });
 
       while (state.offset < file.size) {
         if (state.cancelled) {
           throw new Error(state.cancelReason || "การส่งถูกยกเลิก");
         }
-        await waitForFlowControl(state);
+        await waitForFlowControl(state, state.windowSize);
         if (state.cancelled) {
           throw new Error(state.cancelReason || "การส่งถูกยกเลิก");
         }
@@ -1609,20 +2192,39 @@ async function sendFiles(peerId, files) {
         const seq = state.nextSeq;
         const sliceStart = seq * state.chunkSize;
         const sliceEnd = Math.min(file.size, sliceStart + state.chunkSize);
+        const tRead0 = nowMs();
         const buf = await file.slice(sliceStart, sliceEnd).arrayBuffer();
+        const readMs = nowMs() - tRead0;
 
+        let chunkTiming;
         try {
-          await tx.sendChunk(transferId, fileIndex, seq, buf);
+          chunkTiming = await tx.sendChunk(transferId, fileIndex, seq, buf, state.metrics);
         } catch {
           tx = await recoverTransportAndHandshake(peerId, state);
           if (!tx) throw new Error("การเชื่อมต่อหลุดระหว่างส่ง chunk");
           continue;
         }
 
+        const encryptMs = chunkTiming?.encryptMs || 0;
+        const sendMs = chunkTiming?.sendMs || 0;
+        state.metrics.chunksMeasured += 1;
+        const cCount = state.metrics.chunksMeasured;
+        state.metrics.totalReadMs += readMs;
+        state.metrics.totalEncryptMs += encryptMs;
+        state.metrics.totalSendMs += sendMs;
+        state.metrics.avgReadMs = updateEma(state.metrics.avgReadMs, readMs, cCount);
+        state.metrics.avgEncryptMs = updateEma(state.metrics.avgEncryptMs, encryptMs, cCount);
+        state.metrics.avgSendMs = updateEma(state.metrics.avgSendMs, sendMs, cCount);
+
         state.nextSeq += 1;
         state.offset = sliceEnd;
         const priorFilesBytes = files.slice(0, fileIndex).reduce((s, f) => s + f.size, 0);
         state.sentBytes = priorFilesBytes + state.offset;
+        state.metrics.inFlightChunks = Math.max(0, state.nextSeq - (state.ackedSeq + 1));
+
+        if (state.nextSeq % ACK_BATCH_INTERVAL === 0 || state.offset === file.size) {
+          evaluateBottleneckAndTune(state, tx);
+        }
 
         setProgress(peerId, state.offset / file.size, `ส่ง ${safeName}`);
         updateTransferPanel({
@@ -1635,6 +2237,7 @@ async function sendFiles(peerId, files) {
           totalBytes: state.totalBytes,
           startTime: state.startTime,
           paused: state.paused || state.remotePaused,
+          metrics: state.metrics,
         });
       }
 
@@ -1644,6 +2247,7 @@ async function sendFiles(peerId, files) {
         const waitStart = Date.now();
         while (!state.cancelled && state.ackedSeq < finalSeq && Date.now() - waitStart < 15000) {
           if (state.resumeRequestedSeq !== null) break;
+          const tAck0 = nowMs();
           await new Promise((resolve) => {
             const timer = setTimeout(resolve, 100);
             const w = () => {
@@ -1653,8 +2257,14 @@ async function sendFiles(peerId, files) {
             };
             state.waiters.add(w);
           });
+          state.metrics.ackWaitMs += nowMs() - tAck0;
         }
       }
+      evaluateBottleneckAndTune(state, tx);
+      transferDiagnosticsHistory.set(
+        transferId,
+        buildDiagnosticsSnapshot("send", transferId, peerId, state.metrics, state)
+      );
     }
 
     outgoingTransfers.delete(transferId);
@@ -1663,6 +2273,12 @@ async function sendFiles(peerId, files) {
     toast(tx.mode === "relay" ? "ส่งเสร็จแล้ว (สตรีม E2EE ผ่าน Relay)" : "ส่งเสร็จแล้ว (สตรีม E2EE)");
     return true;
   } catch (err) {
+    if (state.metrics) {
+      transferDiagnosticsHistory.set(
+        transferId,
+        buildDiagnosticsSnapshot("send", transferId, peerId, state.metrics, state)
+      );
+    }
     outgoingTransfers.delete(transferId);
     setProgress(peerId, null);
     showTransferError(err?.message || "การส่งไฟล์ล้มเหลว");
@@ -1677,18 +2293,35 @@ async function recoverTransportAndHandshake(peerId, state) {
     try {
       await ensureWS();
       await ensureE2EE(peerId);
+      if (state?.metrics) {
+        state.metrics.mode = "relay";
+      }
       const tx = {
         mode: "relay",
         chunk: state.chunkSize,
+        windowSize: state.windowSize || MAX_IN_FLIGHT_CHUNKS,
         isOpen: () => ws?.readyState === 1,
-        async sendControl(plainObj) {
+        getBufferedAmount: () => ws?.bufferedAmount || 0,
+        async sendControl(plainObj, metrics = state?.metrics) {
+          await waitForRelayRateLimit(metrics);
           const envMsg = await encryptControlMessage(peerId, plainObj);
-          relaySend(peerId, envMsg);
+          relaySend(peerId, envMsg, metrics);
         },
-        async sendChunk(tId, fIdx, seq, plainBuf) {
-          await waitForWsDrain(ws);
+        async sendChunk(tId, fIdx, seq, plainBuf, metrics = state?.metrics) {
+          await waitForRelayRateLimit(metrics);
+          await waitForWsDrain(ws, metrics);
+          const tEnc0 = nowMs();
           const envMsg = await encryptFileChunk(peerId, tId, fIdx, seq, plainBuf);
-          relaySend(peerId, envMsg);
+          const encryptMs = nowMs() - tEnc0;
+          const tSend0 = nowMs();
+          relaySend(peerId, envMsg, metrics);
+          const sendMs = nowMs() - tSend0;
+          const curBuf = ws?.bufferedAmount || 0;
+          if (metrics) {
+            metrics.bufferedAmount = curBuf;
+            if (curBuf > metrics.maxBufferedAmount) metrics.maxBufferedAmount = curBuf;
+          }
+          return { encryptMs, sendMs, bufferedAmount: curBuf };
         },
       };
       // Query receiver for the next expected chunk sequence so no chunks are lost or duplicated
@@ -1748,29 +2381,40 @@ async function sendPendingShare(peerId) {
 // ================= รับข้อมูล & ยอมรับ/ปฏิเสธ (Streaming Sink + Flow Control ACKs) =================
 const peerDecryptQueues = new Map();
 
-function onEncryptedEnvelope(peerId, envMsg) {
+function onEncryptedEnvelope(peerId, envMsg, via = "") {
   const prev = peerDecryptQueues.get(peerId) || Promise.resolve();
   const next = prev
-    .then(() => processEncryptedEnvelope(peerId, envMsg))
+    .then(() => processEncryptedEnvelope(peerId, envMsg, via))
     .catch(() => {});
   peerDecryptQueues.set(peerId, next);
   return next;
 }
 
-async function processEncryptedEnvelope(peerId, envMsg) {
+async function processEncryptedEnvelope(peerId, envMsg, via = "") {
   if (!envMsg || typeof envMsg !== "object" || typeof envMsg.type !== "string") return;
+  const detectedMode = via || (conns.get(peerId)?.dc?.readyState === "open" ? "p2p" : "relay");
 
   if (envMsg.type === "e2ee-ctrl") {
     const msg = await decryptControlMessage(peerId, envMsg);
     if (!msg || typeof msg.type !== "string") return;
-    await handleDecryptedControl(peerId, msg);
+    await handleDecryptedControl(peerId, msg, detectedMode);
     return;
   }
 
   if (envMsg.type === "e2ee-chunk") {
     const f = incoming.get(peerId);
     if (!f || f.cancelled) return;
+    f.transportMode = detectedMode;
+    if (f.metrics) {
+      f.metrics.mode = detectedMode;
+      const curRate = pruneRateTimestamps(wsRateState.rxTimestamps);
+      f.metrics.rxMsgPerSec = curRate;
+      if (curRate > f.metrics.peakRxMsgPerSec) f.metrics.peakRxMsgPerSec = curRate;
+    }
+
+    const tDec0 = nowMs();
     const dec = await decryptFileChunk(peerId, envMsg);
+    const decryptMs = nowMs() - tDec0;
     if (!dec.ok) {
       if (dec.reason === "duplicate_chunk") {
         // Re-send cumulative ACK so sender advances its sliding window
@@ -1801,14 +2445,35 @@ async function processEncryptedEnvelope(peerId, envMsg) {
       return;
     }
 
+    f.wireReceivedBytes = (f.wireReceivedBytes || 0) + ptBuf.byteLength;
+    const tWrite0 = nowMs();
     try {
       await f.sink.writeChunk(envMsg.seq, ptBuf);
     } catch (err) {
       await clearIncomingState(peerId, err?.message || "เขียนไฟล์ลงพื้นที่จัดเก็บไม่สำเร็จ");
       return;
     }
+    const writeMs = nowMs() - tWrite0;
 
     f.received += ptBuf.byteLength;
+    if (f.metrics) {
+      f.metrics.chunksDecrypted += 1;
+      const dCount = f.metrics.chunksDecrypted;
+      f.metrics.totalDecryptMs += decryptMs;
+      f.metrics.totalWriteMs += writeMs;
+      f.metrics.avgDecryptMs = updateEma(f.metrics.avgDecryptMs, decryptMs, dCount);
+      f.metrics.avgWriteMs = updateEma(f.metrics.avgWriteMs, writeMs, dCount);
+      const c = conns.get(peerId);
+      const curBuf = detectedMode === "p2p" ? (c?.dc?.bufferedAmount || 0) : (ws?.bufferedAmount || 0);
+      f.metrics.bufferedAmount = curBuf;
+      if (curBuf > f.metrics.maxBufferedAmount) f.metrics.maxBufferedAmount = curBuf;
+      f.metrics.bottleneckLabel =
+        writeMs > decryptMs * 2 && writeMs > 2
+          ? `ฝั่งรับ: เขียนลงพื้นที่จัดเก็บใช้เวลาสูงสุด (${formatMs(f.metrics.avgWriteMs)}/chunk)`
+          : `ฝั่งรับ: ถอดรหัส E2EE + เขียนสตรีมปกติ (${detectedMode.toUpperCase()})`;
+      f.metrics.tuningAction = `Sink: ${f.sink?.strategy || "stream"} (จำกัด RAM ${formatSize(f.metrics.maxInFlightBytes)})`;
+    }
+
     refreshIncomingTimer(peerId, f);
     setProgress(peerId, f.received / f.meta.size, `รับ ${f.meta.name}`);
 
@@ -1817,12 +2482,17 @@ async function processEncryptedEnvelope(peerId, envMsg) {
       peerId,
       direction: "recv",
       title: `กำลังรับ ${f.meta.name} จาก ${peerName(peerId)}`,
-      stateLabel: f.paused ? "หยุดชั่วคราว" : "กำลังสตรีมลงพื้นที่จัดเก็บ (E2EE)",
+      stateLabel: f.paused
+        ? "หยุดชั่วคราว"
+        : detectedMode === "p2p"
+        ? "กำลังสตรีมลงพื้นที่จัดเก็บ (P2P E2EE)"
+        : "กำลังสตรีมลงพื้นที่จัดเก็บ (Relay E2EE)",
       transferredBytes: f.received,
       totalBytes: f.meta.size,
       startTime: f.startTime,
       paused: f.paused,
       storageNote: f.sink?.note,
+      metrics: f.metrics,
     });
 
     const isLastChunk = f.received === f.meta.size;
@@ -1832,6 +2502,12 @@ async function processEncryptedEnvelope(peerId, envMsg) {
     }
 
     if (isLastChunk) {
+      if (f.metrics && f.meta?.transferId) {
+        transferDiagnosticsHistory.set(
+          f.meta.transferId,
+          buildDiagnosticsSnapshot("recv", f.meta.transferId, peerId, f.metrics, f)
+        );
+      }
       await finishFile(peerId);
     }
   }
@@ -1847,12 +2523,19 @@ async function sendChunkAck(peerId, f, ackSeq, done = false) {
       receivedBytes: f.received,
       paused: f.paused,
       done,
+      decryptMs: f.metrics ? Number(f.metrics.avgDecryptMs.toFixed(3)) : 0,
+      writeMs: f.metrics ? Number(f.metrics.avgWriteMs.toFixed(3)) : 0,
+      totalDecryptMs: f.metrics ? Number(f.metrics.totalDecryptMs.toFixed(3)) : 0,
+      totalWriteMs: f.metrics ? Number(f.metrics.totalWriteMs.toFixed(3)) : 0,
+      rxMsgPerSec: f.metrics ? f.metrics.rxMsgPerSec : 0,
+      recvSpeedBps: f.metrics ? Math.round(f.metrics.recvSpeedBps) : 0,
+      mode: f.transportMode || "relay",
     });
     sendEnvelopeBestEffort(peerId, ackEnv);
   } catch {}
 }
 
-async function handleDecryptedControl(peerId, msg) {
+async function handleDecryptedControl(peerId, msg, viaMode = "relay") {
   if (msg.type === "text") {
     if (typeof msg.text !== "string" || msg.text.length === 0 || msg.text.length > MAX_TEXT_LENGTH) return;
     addReceivedText(peerName(peerId), msg.text);
@@ -1916,6 +2599,13 @@ async function handleDecryptedControl(peerId, msg) {
       nextChunkSeq: 0,
       lastAckSeq: -1,
       received: 0,
+      wireReceivedBytes: 0,
+      transportMode: msg.mode || viaMode || "relay",
+      metrics: createTransferMetrics(
+        msg.mode || viaMode || "relay",
+        Number.isSafeInteger(msg.chunkSize) && msg.chunkSize > 0 ? msg.chunkSize : 48 * 1024,
+        Number.isSafeInteger(msg.windowSize) && msg.windowSize > 0 ? msg.windowSize : MAX_IN_FLIGHT_CHUNKS
+      ),
       sink,
       paused: false,
       cancelled: false,
@@ -1933,6 +2623,32 @@ async function handleDecryptedControl(peerId, msg) {
     if (!out || out.peerId !== peerId || msg.fileIndex !== out.fileIndex) return;
     if (Number.isSafeInteger(msg.ackSeq) && msg.ackSeq > out.ackedSeq) {
       out.ackedSeq = msg.ackSeq;
+    }
+    if (Number.isSafeInteger(msg.receivedBytes) && msg.receivedBytes >= 0) {
+      const priorFilesBytes = out.files.slice(0, out.fileIndex).reduce((s, f) => s + f.size, 0);
+      out.ackedBytes = priorFilesBytes + msg.receivedBytes;
+    }
+    if (out.metrics) {
+      if (typeof msg.decryptMs === "number" && msg.decryptMs >= 0) {
+        out.metrics.avgDecryptMs = msg.decryptMs;
+      }
+      if (typeof msg.writeMs === "number" && msg.writeMs >= 0) {
+        out.metrics.avgWriteMs = msg.writeMs;
+      }
+      if (typeof msg.totalDecryptMs === "number" && msg.totalDecryptMs >= 0) {
+        out.metrics.totalDecryptMs = msg.totalDecryptMs;
+      }
+      if (typeof msg.totalWriteMs === "number" && msg.totalWriteMs >= 0) {
+        out.metrics.totalWriteMs = msg.totalWriteMs;
+      }
+      if (typeof msg.rxMsgPerSec === "number" && msg.rxMsgPerSec >= 0) {
+        out.metrics.rxMsgPerSec = msg.rxMsgPerSec;
+        if (msg.rxMsgPerSec > out.metrics.peakRxMsgPerSec) {
+          out.metrics.peakRxMsgPerSec = msg.rxMsgPerSec;
+        }
+      }
+      out.metrics.inFlightChunks = Math.max(0, out.nextSeq - (out.ackedSeq + 1));
+      evaluateBottleneckAndTune(out);
     }
     if (typeof msg.paused === "boolean") {
       out.remotePaused = msg.paused;

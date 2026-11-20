@@ -816,4 +816,144 @@ await runTest("11. Disconnect / Resume Recovery, Duplicate & Out-of-Order Chunk 
   assert.equal(vm.runInContext(`incoming.has("${idA}")`, clientB.sandbox), false);
 });
 
+await runTest("12. Transfer Telemetry & Bottleneck Auto-Tuning (Mode P2P/Relay, Separate Tx/Rx Speeds, Read/Encrypt/Send/Decrypt/Write Timings, bufferedAmount/ACK Wait, msg/s & Rate Limit Pacing, Chunk/Window Tuning with E2EE & Mobile RAM Cap)", async () => {
+  const { createClientSandbox } = createStreamingPairSandboxes();
+  const clientA = createClientSandbox(
+    "198.51.100.92",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) Version/17.4 Mobile/15E148 Safari/604.1"
+  );
+  const clientB = createClientSandbox(
+    "198.51.100.92",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/125.0.0.0 Mobile Safari/537.36"
+  );
+
+  await new Promise((r) => setTimeout(r, 60));
+  vm.runInContext(`connect = async () => { throw new Error("Use Relay"); };`, clientA.sandbox);
+  vm.runInContext(`connect = async () => { throw new Error("Use Relay"); };`, clientB.sandbox);
+
+  const idA = vm.runInContext(`myId`, clientA.sandbox);
+  const idB = vm.runInContext(`myId`, clientB.sandbox);
+
+  // 1) Stream 1.15 MB (24 chunks > 16 burst allowance) over Relay to trigger rate-limit pacing & full telemetry
+  const relayFileBytes = new Uint8Array(24 * 48 * 1024);
+  for (let i = 0; i < relayFileBytes.length; i++) relayFileBytes[i] = (i * 17) & 255;
+  clientA.sandbox.telemetryFiles = [
+    new File([relayFileBytes], "telemetry_relay.bin", { type: "application/octet-stream" }),
+  ];
+
+  const sendPromise = vm.runInContext(`sendFiles("${idB}", telemetryFiles)`, clientA.sandbox);
+  await new Promise((r) => setTimeout(r, 40));
+  await clientB.elements.get("#acceptBtn").onclick();
+  const ok = await sendPromise;
+  assert.equal(ok, true);
+  await new Promise((r) => setTimeout(r, 40));
+
+  const senderDiag = vm.runInContext(`getTransferDiagnostics()`, clientA.sandbox);
+  const receiverDiag = vm.runInContext(`getTransferDiagnostics()`, clientB.sandbox);
+  assert.ok(senderDiag, "Sender diagnostics snapshot must be recorded");
+  assert.ok(receiverDiag, "Receiver diagnostics snapshot must be recorded");
+
+  // Verify actual mode detected on both sides
+  assert.equal(senderDiag.mode, "relay");
+  assert.equal(receiverDiag.mode, "relay");
+
+  // Verify separate send and receive speeds
+  assert.ok(senderDiag.sendSpeedBps > 0, "Sender sendSpeedBps must be measured");
+  assert.ok(senderDiag.recvSpeedBps > 0, "Sender recvSpeedBps (from receiver ACKs) must be measured separately");
+  assert.ok(receiverDiag.recvSpeedBps > 0, "Receiver recvSpeedBps must be measured");
+  assert.ok(receiverDiag.sendSpeedBps > 0, "Receiver sendSpeedBps must be measured");
+
+  // Verify all 5 stage timings (read, encrypt, send, decrypt, write) are collected
+  assert.ok(senderDiag.timings.totalReadMs >= 0 && senderDiag.timings.readMs >= 0);
+  assert.ok(senderDiag.timings.totalEncryptMs > 0 && senderDiag.timings.encryptMs > 0);
+  assert.ok(senderDiag.timings.totalSendMs >= 0);
+  assert.ok(senderDiag.timings.decryptMs > 0, "Receiver decryptMs must be reported back to sender via E2EE chunk-ack");
+  assert.ok(senderDiag.timings.writeMs >= 0, "Receiver writeMs must be reported back to sender via E2EE chunk-ack");
+
+  // Verify msg/s & Relay rate-limit pacing engaged before hitting 160 msg/s server disconnect
+  assert.ok(senderDiag.rate.txMsgPerSec > 0);
+  assert.ok(senderDiag.rate.rateLimitThrottles > 0, "Relay pacer must throttle after 16-chunk burst to protect against 160 msg/s limit");
+  assert.equal(senderDiag.tuning.bottleneckCode, "relay-rate-limit");
+  assert.equal(senderDiag.tuning.windowSize, 12, "Relay rate-limit bottleneck must tighten send window to 12 chunks");
+  assert.equal(senderDiag.tuning.maxInFlightBytes, 1024 * 1024, "Mobile memory cap must remain 1 MB");
+  assert.equal(senderDiag.tuning.e2eeActive, true);
+
+  // Verify UI diagnostic elements in #transferPanel are populated with all 5 required telemetry rows
+  assert.ok(clientA.elements.get("#tpDiagMode").textContent.includes("Relay"));
+  assert.ok(clientA.elements.get("#tpDiagSpeeds").textContent.includes("ความเร็วส่ง (Tx)"));
+  assert.ok(clientA.elements.get("#tpDiagSpeeds").textContent.includes("ความเร็วรับ (Rx)"));
+  assert.ok(clientA.elements.get("#tpDiagTimings").textContent.includes("อ่าน:"));
+  assert.ok(clientA.elements.get("#tpDiagTimings").textContent.includes("เข้ารหัส:"));
+  assert.ok(clientA.elements.get("#tpDiagTimings").textContent.includes("ถอดรหัส:"));
+  assert.ok(clientA.elements.get("#tpDiagTimings").textContent.includes("เขียน:"));
+  assert.ok(clientA.elements.get("#tpDiagBuffer").textContent.includes("bufferedAmount:"));
+  assert.ok(clientA.elements.get("#tpDiagRate").textContent.includes("msg/s"));
+  assert.ok(clientA.elements.get("#tpDiagBottleneck").textContent.includes("Relay:"));
+
+  // 2) Verify P2P bottleneck detector & adaptive chunk/window tuning (Buffer vs ACK vs Crypto vs Storage Write)
+  // 2a) P2P ACK-bound -> expands window within mobile 1 MB RAM budget
+  const p2pAckState = vm.runInContext(`({
+    peerId: "${idB}",
+    chunkSize: 48 * 1024,
+    windowSize: 16,
+    metrics: Object.assign(createTransferMetrics("p2p", 48 * 1024, 16), {
+      chunksMeasured: 20,
+      ackWaitCount: 3,
+      ackWaitMs: 45,
+      bufferWaitCount: 0,
+      bufferWaitMs: 0,
+      bufferedAmount: 64 * 1024,
+      avgEncryptMs: 0.12,
+      avgDecryptMs: 0.11,
+      avgWriteMs: 0.35,
+    })
+  })`, clientA.sandbox);
+  clientA.sandbox.p2pAckState = p2pAckState;
+  vm.runInContext(`evaluateBottleneckAndTune(p2pAckState, { mode: "p2p", chunk: 48 * 1024, getBufferedAmount: () => 64 * 1024 })`, clientA.sandbox);
+  assert.equal(p2pAckState.metrics.bottleneckCode, "p2p-ack-window");
+  assert.equal(p2pAckState.windowSize, 20, "P2P ACK bottleneck on mobile must expand window from 16 to 20 (capped by 1 MB mobile RAM budget)");
+  assert.ok(p2pAckState.windowSize * p2pAckState.chunkSize <= 1024 * 1024);
+
+  // 2b) P2P DataChannel Buffer-bound -> shrinks window to relieve backpressure
+  const p2pBufState = vm.runInContext(`({
+    peerId: "${idB}",
+    chunkSize: 48 * 1024,
+    windowSize: 20,
+    metrics: Object.assign(createTransferMetrics("p2p", 48 * 1024, 20), {
+      chunksMeasured: 20,
+      bufferWaitCount: 2,
+      bufferWaitMs: 30,
+      bufferedAmount: 1800 * 1024,
+      ackWaitCount: 0,
+      ackWaitMs: 0,
+    })
+  })`, clientA.sandbox);
+  clientA.sandbox.p2pBufState = p2pBufState;
+  vm.runInContext(`evaluateBottleneckAndTune(p2pBufState, { mode: "p2p", chunk: 48 * 1024, getBufferedAmount: () => 1800 * 1024 })`, clientA.sandbox);
+  assert.equal(p2pBufState.metrics.bottleneckCode, "p2p-buffer");
+  assert.equal(p2pBufState.windowSize, 16, "P2P buffer backpressure must reduce window from 20 to 16");
+
+  // 2c) P2P Receiver Storage Write-bound -> caps window to 10 on mobile to prevent decrypt queue buildup in RAM
+  const p2pWriteState = vm.runInContext(`({
+    peerId: "${idB}",
+    chunkSize: 48 * 1024,
+    windowSize: 16,
+    metrics: Object.assign(createTransferMetrics("p2p", 48 * 1024, 16), {
+      chunksMeasured: 20,
+      bufferWaitCount: 0,
+      bufferWaitMs: 0,
+      bufferedAmount: 32 * 1024,
+      ackWaitCount: 2,
+      ackWaitMs: 25,
+      avgEncryptMs: 0.1,
+      avgDecryptMs: 0.1,
+      avgWriteMs: 5.5,
+    })
+  })`, clientA.sandbox);
+  clientA.sandbox.p2pWriteState = p2pWriteState;
+  vm.runInContext(`evaluateBottleneckAndTune(p2pWriteState, { mode: "p2p", chunk: 48 * 1024, getBufferedAmount: () => 32 * 1024 })`, clientA.sandbox);
+  assert.equal(p2pWriteState.metrics.bottleneckCode, "p2p-storage-write");
+  assert.equal(p2pWriteState.windowSize, 10, "P2P slow storage write on mobile must cap window at 10 chunks to protect RAM");
+});
+
 console.log(`\nAll ${passed} streaming, backpressure, resume & E2EE security test suites passed!`);

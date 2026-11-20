@@ -940,6 +940,32 @@
       color: #cbd5e1;
     }
 
+    .tp-diagnostics {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(8, 18, 33, 0.65);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      display: grid;
+      gap: 4px;
+      font-size: 11.5px;
+      color: #cbd5e1;
+      line-height: 1.4;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tp-diag-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .tp-diag-label {
+      color: #93c5fd;
+      font-weight: 600;
+    }
+
     .tp-storage-note {
       margin-top: 6px;
       font-size: 11.5px;
@@ -1184,6 +1210,14 @@
       <span id="tpSizeInfo">0 B / 0 B (0%)</span>
       <span id="tpSpeedInfo">0 KB/s</span>
       <span id="tpEtaInfo">ETA: --</span>
+    </div>
+    <div class="tp-diagnostics" id="tpDiagnostics">
+      <div class="tp-diag-row"><span class="tp-diag-label">โหมดและหน้าต่างส่ง:</span><span id="tpDiagMode">--</span></div>
+      <div class="tp-diag-row"><span class="tp-diag-label">ความเร็วแยกส่ง/รับ:</span><span id="tpDiagSpeeds">ส่ง: -- | รับ: --</span></div>
+      <div class="tp-diag-row"><span class="tp-diag-label">เวลาแต่ละขั้นตอน:</span><span id="tpDiagTimings">อ่าน: -- | เข้ารหัส: -- | ส่ง: -- | ถอดรหัส: -- | เขียน: --</span></div>
+      <div class="tp-diag-row"><span class="tp-diag-label">Buffer &amp; ACK:</span><span id="tpDiagBuffer">bufferedAmount: 0 B | รอ Buffer: 0 ms | รอ ACK: 0 ms</span></div>
+      <div class="tp-diag-row"><span class="tp-diag-label">อัตราข้อความ &amp; Rate Limit:</span><span id="tpDiagRate">0 msg/s | ชน/ชะลอ Rate Limit: 0 ครั้ง</span></div>
+      <div class="tp-diag-row"><span class="tp-diag-label">วิเคราะห์คอขวด:</span><span id="tpDiagBottleneck">กำลังวิเคราะห์...</span></div>
     </div>
     <div class="tp-storage-note" id="tpStorageNote"></div>
     <div class="tp-error" id="tpError" hidden></div>
