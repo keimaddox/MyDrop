@@ -10,13 +10,42 @@ const iceReady = fetch("/ice")
   .catch(() => {});
 
 const MAX_BUFFER = 8 * 1024 * 1024; // คิวค้างส่งได้ไม่เกิน 8MB
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
+const MAX_TRANSFER_SIZE = 100 * 1024 * 1024;
+const MAX_FILES_PER_TRANSFER = 10;
+const MAX_TEXT_LENGTH = 16 * 1024;
+const MAX_PENDING_REQUESTS = 5;
+const INCOMING_TIMEOUT_MS = 45000;
+const ROOM_CODE_RE = /^[a-zA-Z0-9_-]{3,48}$/;
+const BIDI_AND_CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const WINDOWS_RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+const DANGEROUS_MIMES = new Set([
+  "text/html",
+  "application/xhtml+xml",
+  "image/svg+xml",
+  "text/javascript",
+  "application/javascript",
+  "application/x-javascript",
+  "text/xml",
+  "application/xml",
+]);
 const ICONS = { phone: "📱", tablet: "📱", desktop: "💻" };
 
 const $ = (s) => document.querySelector(s);
 let ws;
 let myId = sessionStorage.getItem("mydrop_id") || "";
 let myName = sessionStorage.getItem("mydrop_name") || "";
-let currentRoom = new URLSearchParams(location.search).get("room") || "";
+let currentRoom = "";
+{
+  const rawRoom = (new URLSearchParams(location.search).get("room") || "").trim();
+  if (rawRoom && ROOM_CODE_RE.test(rawRoom)) {
+    currentRoom = rawRoom;
+  } else if (rawRoom) {
+    const cleanUrl = new URL(location.href);
+    cleanUrl.searchParams.delete("room");
+    history.replaceState(null, "", cleanUrl.pathname + (cleanUrl.search || ""));
+  }
+}
 let manualClose = false;
 let reconnectTimer = null;
 let lastWsActivity = 0;
@@ -24,14 +53,73 @@ const wsWaiters = new Set();
 let peers = [];
 
 const conns = new Map();            // peerId -> { pc, dc, polite, makingOffer, ignoreOffer, pending, chunk, open, resolveOpen, rejectOpen, timer }
-const incoming = new Map();         // peerId -> { meta, chunks, received }
+const incoming = new Map();         // peerId -> { meta, chunks, received, timer }
 const pendingResponses = new Map(); // transferId -> { peerId, resolve, reject }
-const acceptedTransfers = new Set();
+const acceptedTransfers = new Map(); // transferId -> { peerId, remaining }
 const seenRequests = new Set();
 const peerStatus = new Map();       // peerId -> string
 const peerProgress = new Map();     // peerId -> { ratio, label }
 const requestQueue = [];
 let activeRequest = null;
+
+function sanitizeFilename(rawName) {
+  if (typeof rawName !== "string") return "file";
+  let clean = rawName
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop()
+    .replace(BIDI_AND_CONTROL_CHARS, "")
+    .replace(/[<>:"|?*]/g, "_")
+    .trim();
+  clean = clean.replace(/^\.+/, "").replace(/\.+$/, "");
+  if (!clean || WINDOWS_RESERVED_NAMES.test(clean)) {
+    clean = "file_" + (clean || "unnamed");
+  }
+  if (clean.length > 255) {
+    const dotIdx = clean.lastIndexOf(".");
+    const ext = dotIdx > 0 && clean.length - dotIdx <= 16 ? clean.slice(dotIdx) : "";
+    clean = clean.slice(0, Math.max(1, 255 - ext.length)) + ext;
+  }
+  return clean;
+}
+
+function validateOutgoingFiles(files) {
+  if (!Array.isArray(files) || files.length === 0) return { ok: false, error: "กรุณาเลือกไฟล์ก่อนส่ง" };
+  if (files.length > MAX_FILES_PER_TRANSFER) {
+    return { ok: false, error: `ส่งได้สูงสุด ${MAX_FILES_PER_TRANSFER} ไฟล์ต่อครั้ง` };
+  }
+  let total = 0;
+  for (const f of files) {
+    if (!f || typeof f.size !== "number" || !Number.isSafeInteger(f.size) || f.size < 0) {
+      return { ok: false, error: "ข้อมูลไฟล์ไม่ถูกต้อง" };
+    }
+    if (f.size > MAX_FILE_SIZE) {
+      return { ok: false, error: `ไฟล์ "${sanitizeFilename(f.name)}" มีขนาดเกิน ${formatSize(MAX_FILE_SIZE)}` };
+    }
+    total += f.size;
+    if (total > MAX_TRANSFER_SIZE) {
+      return { ok: false, error: `ขนาดไฟล์รวมเกิน ${formatSize(MAX_TRANSFER_SIZE)} ต่อครั้ง` };
+    }
+  }
+  return { ok: true, total };
+}
+
+function clearIncomingState(peerId, notifyText = "") {
+  const f = incoming.get(peerId);
+  if (!f) return;
+  clearTimeout(f.timer);
+  incoming.delete(peerId);
+  setProgress(peerId, null);
+  if (notifyText) toast(notifyText);
+}
+
+function refreshIncomingTimer(peerId, f) {
+  clearTimeout(f.timer);
+  f.timer = setTimeout(() => {
+    acceptedTransfers.delete(f.meta?.transferId);
+    clearIncomingState(peerId, `การรับไฟล์ ${f.meta?.name || ""} หมดเวลา`);
+  }, INCOMING_TIMEOUT_MS);
+}
 
 function uuid() {
   if (crypto?.randomUUID) return crypto.randomUUID();
@@ -144,7 +232,12 @@ function updateRoomUI() {
 }
 
 function switchRoom(newRoom) {
-  currentRoom = newRoom.trim();
+  const trimmed = (newRoom || "").trim();
+  if (trimmed && !ROOM_CODE_RE.test(trimmed)) {
+    toast("รหัสห้องต้องมีความยาว 3-48 ตัวอักษร (a-z, 0-9, -, _)");
+    return;
+  }
+  currentRoom = trimmed;
   const url = new URL(location.href);
   if (currentRoom) url.searchParams.set("room", currentRoom);
   else url.searchParams.delete("room");
@@ -152,6 +245,8 @@ function switchRoom(newRoom) {
   updateRoomUI();
 
   for (const peerId of [...conns.keys()]) closeConn(peerId);
+  for (const peerId of [...incoming.keys()]) clearIncomingState(peerId);
+  acceptedTransfers.clear();
   peers = [];
   renderPeers();
 
@@ -202,8 +297,6 @@ function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const params = new URLSearchParams();
   if (currentRoom) params.set("room", currentRoom);
-  if (myId) params.set("id", myId);
-  if (myName) params.set("name", myName);
   const qs = params.toString();
   const socket = new WebSocket(`${proto}://${location.host}/ws${qs ? "?" + qs : ""}`);
   ws = socket;
@@ -216,7 +309,9 @@ function connectWS() {
     if (ws !== socket) return;
     notifyWsWaiters();
     if (e.data === "pong") return;
-    const msg = JSON.parse(e.data);
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (!msg || typeof msg.type !== "string") return;
     if (msg.type === "welcome") {
       myId = msg.id;
       myName = msg.name;
@@ -226,13 +321,22 @@ function connectWS() {
       } catch {}
       $("#me").textContent = `คุณคือ ${msg.name}`;
     } else if (msg.type === "peers") {
-      peers = msg.peers;
+      peers = Array.isArray(msg.peers) ? msg.peers : [];
+      const activeIds = new Set(peers.map((p) => p.id));
+      for (const peerId of [...incoming.keys()]) {
+        if (!activeIds.has(peerId)) clearIncomingState(peerId);
+      }
+      for (const [tid, entry] of [...acceptedTransfers.entries()]) {
+        if (!activeIds.has(entry.peerId)) acceptedTransfers.delete(tid);
+      }
       renderPeers();
     } else if (msg.type === "signal") {
       onSignal(msg.from, msg.data);
     } else if (msg.type === "relay") {
       if (msg.data?.type === "chunk") {
-        onData(msg.from, base64ToBuf(msg.data.data));
+        let buf;
+        try { buf = base64ToBuf(msg.data.data); } catch { return; }
+        onData(msg.from, buf);
       } else {
         onData(msg.from, JSON.stringify(msg.data));
       }
@@ -532,6 +636,11 @@ async function onSignal(from, data) {
 // ================= ส่งไฟล์ / ข้อความ =================
 async function sendFiles(peerId, files) {
   if (!files.length) return false;
+  const check = validateOutgoingFiles(files);
+  if (!check.ok) {
+    toast(check.error);
+    return false;
+  }
   let tx;
   try {
     setStatus(peerId, "กำลังเชื่อมต่อ...");
@@ -559,7 +668,7 @@ async function sendFiles(peerId, files) {
   const reqMsg = {
     type: "file-request",
     transferId,
-    files: files.map((f) => ({ name: f.name, size: f.size, mime: f.type })),
+    files: files.map((f) => ({ name: sanitizeFilename(f.name), size: f.size, mime: f.type })),
   };
   try {
     tx.sendControl(reqMsg);
@@ -595,6 +704,7 @@ async function sendFiles(peerId, files) {
   }
 
   for (const file of files) {
+    const safeName = sanitizeFilename(file.name);
     if (!tx.isOpen()) {
       try {
         await ensureWS();
@@ -619,7 +729,7 @@ async function sendFiles(peerId, files) {
     tx.sendControl({
       type: "header",
       transferId,
-      name: file.name,
+      name: safeName,
       size: file.size,
       mime: file.type,
     });
@@ -633,7 +743,7 @@ async function sendFiles(peerId, files) {
       const buf = await file.slice(offset, offset + tx.chunk).arrayBuffer();
       await tx.sendChunk(buf);
       offset += buf.byteLength;
-      setProgress(peerId, offset / file.size, `ส่ง ${file.name}`);
+      setProgress(peerId, offset / file.size, `ส่ง ${safeName}`);
     }
   }
   setProgress(peerId, null);
@@ -644,6 +754,10 @@ async function sendFiles(peerId, files) {
 async function sendText(peerId, presetText = null) {
   const text = presetText ?? prompt("พิมพ์ข้อความ:");
   if (!text) return false;
+  if (typeof text !== "string" || text.length > MAX_TEXT_LENGTH) {
+    toast("ข้อความยาวเกินกำหนด (สูงสุด 16 KB)");
+    return false;
+  }
   try {
     const tx = await getTransport(peerId);
     tx.sendControl({ type: "text", text });
@@ -671,34 +785,71 @@ async function sendPendingShare(peerId) {
 // ================= รับข้อมูล & ยอมรับ/ปฏิเสธ =================
 function onData(peerId, data) {
   if (typeof data === "string") {
-    const msg = JSON.parse(data);
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+    if (!msg || typeof msg.type !== "string") return;
     if (msg.type === "text") {
+      if (typeof msg.text !== "string" || msg.text.length === 0 || msg.text.length > MAX_TEXT_LENGTH) return;
       addReceivedText(peerName(peerId), msg.text);
     } else if (msg.type === "file-request") {
-      if (seenRequests.has(msg.transferId)) return;
+      if (typeof msg.transferId !== "string" || msg.transferId.length > 80 ||
+          !Array.isArray(msg.files) || msg.files.length < 1 ||
+          msg.files.length > MAX_FILES_PER_TRANSFER || seenRequests.has(msg.transferId)) return;
+      const validFiles = msg.files.every((f) =>
+        f && typeof f.name === "string" && f.name.length > 0 && f.name.length <= 255 &&
+        Number.isSafeInteger(f.size) && f.size >= 0 && f.size <= MAX_FILE_SIZE
+      );
+      const total = msg.files.reduce((sum, f) => sum + (Number.isSafeInteger(f?.size) ? f.size : 0), 0);
+      if (!validFiles || total > MAX_TRANSFER_SIZE) return;
+      if (requestQueue.length >= MAX_PENDING_REQUESTS) return;
       seenRequests.add(msg.transferId);
-      requestQueue.push({ peerId, transferId: msg.transferId, files: msg.files || [] });
+      if (seenRequests.size > 200) seenRequests.delete(seenRequests.values().next().value);
+      const sanitizedFiles = msg.files.map((f) => ({
+        name: sanitizeFilename(f.name),
+        size: f.size,
+        mime: typeof f.mime === "string" ? f.mime.slice(0, 255) : "",
+      }));
+      requestQueue.push({ peerId, transferId: msg.transferId, files: sanitizedFiles });
       processRequestQueue();
     } else if (msg.type === "file-response") {
+      if (typeof msg.transferId !== "string" || typeof msg.accepted !== "boolean") return;
       const pending = pendingResponses.get(msg.transferId);
-      if (pending) {
+      if (pending && pending.peerId === peerId) {
         pendingResponses.delete(msg.transferId);
         pending.resolve(Boolean(msg.accepted));
       }
     } else if (msg.type === "header") {
-      if (!acceptedTransfers.has(msg.transferId)) return;
-      incoming.set(peerId, { meta: msg, chunks: [], received: 0 });
-      if (msg.size === 0) finishFile(peerId);
+      const accepted = acceptedTransfers.get(msg.transferId);
+      if (!accepted || accepted.peerId !== peerId || accepted.remaining <= 0 ||
+          typeof msg.name !== "string" || msg.name.length < 1 || msg.name.length > 255 ||
+          !Number.isSafeInteger(msg.size) || msg.size < 0 || msg.size > MAX_FILE_SIZE ||
+          incoming.has(peerId)) return;
+      const safeMeta = {
+        ...msg,
+        name: sanitizeFilename(msg.name),
+      };
+      const entry = { meta: safeMeta, chunks: [], received: 0, timer: null };
+      incoming.set(peerId, entry);
+      if (safeMeta.size === 0) {
+        finishFile(peerId);
+      } else {
+        refreshIncomingTimer(peerId, entry);
+      }
     }
     return;
   }
 
   const f = incoming.get(peerId);
-  if (!f) return;
+  if (!f || !(data instanceof ArrayBuffer) || data.byteLength === 0 ||
+      f.received + data.byteLength > f.meta.size || f.received + data.byteLength > MAX_FILE_SIZE) {
+    if (f) clearIncomingState(peerId);
+    return;
+  }
   f.chunks.push(data);
   f.received += data.byteLength;
+  refreshIncomingTimer(peerId, f);
   setProgress(peerId, f.received / f.meta.size, `รับ ${f.meta.name}`);
-  if (f.received >= f.meta.size) finishFile(peerId);
+  if (f.received === f.meta.size) finishFile(peerId);
 }
 
 function formatSize(bytes) {
@@ -732,11 +883,13 @@ function processRequestQueue() {
 
 async function respondToActiveRequest(accepted) {
   if (!activeRequest) return;
-  const { peerId, transferId } = activeRequest;
+  const { peerId, transferId, files } = activeRequest;
   activeRequest = null;
   $("#confirmModal").style.display = "none";
 
-  if (accepted) acceptedTransfers.add(transferId);
+  if (accepted) {
+    acceptedTransfers.set(transferId, { peerId, remaining: Math.max(1, files.length) });
+  }
   const reply = { type: "file-response", transferId, accepted };
   const c = conns.get(peerId);
   let sentP2P = false;
@@ -760,11 +913,24 @@ $("#rejectBtn").onclick = () => respondToActiveRequest(false);
 
 function finishFile(peerId) {
   const f = incoming.get(peerId);
+  if (f) clearTimeout(f.timer);
   incoming.delete(peerId);
-  const blob = new Blob(f.chunks, { type: f.meta.mime || "application/octet-stream" });
-  addReceivedFile(peerName(peerId), f.meta.name, blob);
+  if (!f || f.received !== f.meta.size) return;
+  const accepted = acceptedTransfers.get(f.meta.transferId);
+  if (accepted) {
+    accepted.remaining -= 1;
+    if (accepted.remaining <= 0) acceptedTransfers.delete(f.meta.transferId);
+  }
+  const rawMime = typeof f.meta.mime === "string" ? f.meta.mime.trim().toLowerCase() : "";
+  const safeMime =
+    /^[\w.+-]+\/[\w.+-]+$/.test(rawMime) && !DANGEROUS_MIMES.has(rawMime)
+      ? rawMime
+      : "application/octet-stream";
+  const safeName = sanitizeFilename(f.meta.name);
+  const blob = new Blob(f.chunks, { type: safeMime });
+  addReceivedFile(peerName(peerId), safeName, blob);
   setProgress(peerId, null);
-  toast(`ได้รับ ${f.meta.name}`);
+  toast(`ได้รับ ${safeName}`);
 }
 
 // ================= UI =================
@@ -791,6 +957,11 @@ function updateDropZoneUI() {
 
 async function handleStagedFiles(files) {
   if (!files.length) return;
+  const check = validateOutgoingFiles(files);
+  if (!check.ok) {
+    toast(check.error);
+    return;
+  }
   if (peers.length === 1) {
     await sendFiles(peers[0].id, files);
     return;

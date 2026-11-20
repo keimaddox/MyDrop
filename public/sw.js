@@ -1,4 +1,4 @@
-const CACHE_NAME = "mydrop-v3";
+const CACHE_NAME = "mydrop-v4";
 const ASSETS = [
   "/",
   "/index.html",
