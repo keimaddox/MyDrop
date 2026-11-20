@@ -1,0 +1,1096 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0b192c" />
+  <title>MyDrop</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+  <style>
+    :root {
+      --bg-deep: #081221;
+      --bg-mid: #0f223d;
+      --bg-glow: #1a365d;
+      --panel-bg: rgba(23, 41, 69, 0.75);
+      --panel-border: rgba(148, 163, 184, 0.22);
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --accent-blue: #60a5fa;
+      --accent-green: #22c55e;
+      --grad-ring: linear-gradient(135deg, #7dd3fc 0%, #fde68a 50%, #f9a8d4 100%);
+      --grad-btn: linear-gradient(90deg, #93c5fd 0%, #fed7aa 55%, #fbcfe8 100%);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Inter", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 50% 38%, var(--bg-glow) 0%, var(--bg-mid) 48%, var(--bg-deep) 100%);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      overflow-x: hidden;
+    }
+
+    /* ================= Top Navigation Bar ================= */
+    header {
+      width: 100%;
+      max-width: 1040px;
+      padding: 18px 24px 8px;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      gap: 12px;
+      position: relative;
+      z-index: 20;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      justify-self: start;
+    }
+
+    .brand-logo {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      padding: 2px;
+      background: var(--grad-ring);
+      box-shadow: 0 0 18px rgba(251, 191, 36, 0.28);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .brand-logo-inner {
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      background: #10233f;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .brand-logo-inner svg {
+      width: 22px;
+      height: 22px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      background: linear-gradient(90deg, #f8fafc 0%, #fdba74 52%, #f472b6 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .status-pill {
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      backdrop-filter: blur(12px);
+      border-radius: 14px;
+      padding: 8px 20px;
+      text-align: center;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+    }
+
+    .status-pill-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #f8fafc;
+    }
+
+    .status-pill-sub {
+      font-size: 12px;
+      color: #cbd5e1;
+      margin-top: 3px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      box-shadow: 0 0 8px var(--accent-green);
+      display: inline-block;
+      flex-shrink: 0;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      justify-self: end;
+    }
+
+    #installBtn {
+      padding: 7px 14px;
+      border: 0;
+      border-radius: 999px;
+      background: var(--grad-btn);
+      color: #0f172a;
+      font-weight: 700;
+      font-size: 12px;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(147, 197, 253, 0.25);
+    }
+
+    .icon-btn {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      border: 1px solid var(--panel-border);
+      background: var(--panel-bg);
+      color: #cbd5e1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: .2s;
+      position: relative;
+    }
+
+    .icon-btn:hover, .icon-btn.active {
+      border-color: var(--accent-blue);
+      color: #fff;
+      background: rgba(37, 65, 108, 0.9);
+    }
+
+    .icon-btn svg {
+      width: 18px;
+      height: 18px;
+    }
+
+    /* ================= Collapsible Room Popover ================= */
+    #roomPanel {
+      width: calc(100% - 32px);
+      max-width: 480px;
+      margin-top: 8px;
+      background: rgba(18, 35, 61, 0.92);
+      border: 1px solid rgba(96, 165, 250, 0.35);
+      backdrop-filter: blur(14px);
+      border-radius: 14px;
+      padding: 12px 16px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+      z-index: 25;
+    }
+
+    #roomForm {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    #roomInput {
+      flex: 1;
+      min-width: 180px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      background: #0f1e36;
+      color: #e2e8f0;
+      font-size: 14px;
+    }
+
+    #roomForm button {
+      padding: 8px 14px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--grad-btn);
+      color: #0f172a;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    #roomForm button.alt {
+      background: #334155;
+      color: #e2e8f0;
+    }
+
+    /* ================= Share Banner ================= */
+    #shareBanner {
+      width: calc(100% - 32px);
+      max-width: 640px;
+      margin-top: 10px;
+      background: rgba(12, 74, 110, 0.85);
+      border: 1px solid #38bdf8;
+      border-radius: 12px;
+      padding: 10px 16px;
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      z-index: 15;
+    }
+
+    #shareBanner button {
+      border: 0;
+      border-radius: 8px;
+      padding: 6px 12px;
+      background: #334155;
+      color: #e2e8f0;
+      cursor: pointer;
+    }
+
+    /* ================= Radar Stage ================= */
+    .radar-section {
+      position: relative;
+      width: 100%;
+      max-width: 960px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      margin: 6px 0 4px;
+      padding: 0 16px;
+    }
+
+    .wave-bg {
+      position: absolute;
+      top: 46%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 100%;
+      max-width: 920px;
+      height: 120px;
+      pointer-events: none;
+      opacity: 0.35;
+      z-index: 0;
+    }
+
+    .radar-stage {
+      position: relative;
+      width: min(440px, 88vw);
+      height: min(390px, 82vw);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 2;
+    }
+
+    .radar-rings {
+      position: absolute;
+      width: min(340px, 74vw);
+      height: min(340px, 74vw);
+      border-radius: 50%;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      background: radial-gradient(circle, rgba(56, 189, 248, 0.08) 0%, rgba(15, 34, 61, 0.25) 70%, transparent 100%);
+      pointer-events: none;
+      overflow: hidden;
+    }
+
+    .radar-rings::before,
+    .radar-rings::after {
+      content: "";
+      position: absolute;
+      border-radius: 50%;
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+    }
+
+    .radar-rings::before {
+      width: 68%;
+      height: 68%;
+    }
+
+    .radar-rings::after {
+      width: 38%;
+      height: 38%;
+    }
+
+    .radar-cross-h,
+    .radar-cross-v {
+      position: absolute;
+      background: rgba(148, 163, 184, 0.11);
+      pointer-events: none;
+    }
+
+    .radar-cross-h {
+      width: 100%;
+      height: 1px;
+      top: 50%;
+      left: 0;
+    }
+
+    .radar-cross-v {
+      height: 100%;
+      width: 1px;
+      left: 50%;
+      top: 0;
+    }
+
+    .radar-sweep {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background: conic-gradient(from 18deg at 50% 50%, rgba(96, 165, 250, 0.22) 0deg, rgba(96, 165, 250, 0.03) 55deg, transparent 62deg);
+      animation: radarSpin 10s linear infinite;
+      pointer-events: none;
+    }
+
+    @keyframes radarSpin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    /* Center Me Node */
+    .me-node {
+      position: relative;
+      z-index: 5;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      pointer-events: none;
+    }
+
+    .me-avatar {
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      padding: 3px;
+      background: var(--grad-ring);
+      box-shadow: 0 0 32px rgba(251, 191, 36, 0.35), 0 0 60px rgba(96, 165, 250, 0.25);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .me-avatar-inner {
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      background: linear-gradient(145deg, rgba(30, 58, 95, 0.88), rgba(15, 30, 54, 0.94));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #0f172a;
+    }
+
+    .me-avatar-inner svg {
+      width: 46px;
+      height: 46px;
+    }
+
+    .me-label {
+      margin-top: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #f8fafc;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.65);
+    }
+
+    #me {
+      font-size: 12px;
+      color: #93c5fd;
+      margin-top: 2px;
+      font-weight: 500;
+    }
+
+    /* Peer Nodes on Radar */
+    #peers {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 6;
+    }
+
+    .peer {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      pointer-events: auto;
+      cursor: pointer;
+      user-select: none;
+      transition: transform .2s ease;
+      width: 128px;
+    }
+
+    .peer:hover {
+      transform: translate(-50%, -50%) scale(1.06);
+    }
+
+    .peer.drag .peer-ring {
+      box-shadow: 0 0 28px #38bdf8, 0 0 45px rgba(56, 189, 248, 0.6);
+      transform: scale(1.1);
+    }
+
+    .peer.staged-ready .peer-ring {
+      animation: pulseRing 1.4s ease-in-out infinite;
+    }
+
+    @keyframes pulseRing {
+      0%, 100% { box-shadow: 0 0 18px rgba(251, 191, 36, 0.35); }
+      50% { box-shadow: 0 0 30px rgba(56, 189, 248, 0.85), 0 0 46px rgba(251, 191, 36, 0.55); }
+    }
+
+    .peer-avatar-wrap {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .peer-ring {
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      padding: 2.5px;
+      background: var(--grad-ring);
+      box-shadow: 0 0 22px rgba(251, 191, 36, 0.3), 0 0 36px rgba(96, 165, 250, 0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: .2s;
+    }
+
+    .peer-ring-inner {
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 30%, rgba(51, 83, 128, 0.9), rgba(16, 33, 58, 0.95));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #f8fafc;
+    }
+
+    .peer-ring-inner svg {
+      width: 30px;
+      height: 30px;
+    }
+
+    /* Small floating action buttons on peer avatar */
+    .peer-action-btn {
+      position: absolute;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      background: rgba(15, 30, 54, 0.92);
+      color: #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+      transition: .15s;
+      padding: 0;
+    }
+
+    .peer-action-btn:hover {
+      background: #38bdf8;
+      color: #0f172a;
+      border-color: #38bdf8;
+      transform: scale(1.12);
+    }
+
+    .peer-action-btn.msg {
+      top: -4px;
+      right: -6px;
+    }
+
+    .peer-action-btn.share-send {
+      bottom: -4px;
+      right: -6px;
+      background: #22c55e;
+      color: #0f172a;
+      border-color: #bbf7d0;
+    }
+
+    .peer-action-btn svg {
+      width: 13px;
+      height: 13px;
+    }
+
+    .peer-type {
+      margin-top: 6px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #f8fafc;
+      line-height: 1.2;
+    }
+
+    .peer .name {
+      font-size: 11.5px;
+      color: #cbd5e1;
+      margin-top: 1px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 124px;
+    }
+
+    .progress {
+      width: 96px;
+      height: 5px;
+      background: rgba(51, 65, 85, 0.8);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-top: 5px;
+      display: none;
+    }
+
+    .progress .bar {
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, #38bdf8, #22c55e);
+    }
+
+    .status {
+      font-size: 11px;
+      color: #7dd3fc;
+      min-height: 15px;
+      margin-top: 2px;
+      max-width: 126px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Hint below radar */
+    .radar-hint {
+      text-align: center;
+      margin-top: 2px;
+      z-index: 4;
+    }
+
+    .radar-hint-main {
+      font-size: 14px;
+      font-weight: 700;
+      color: #f1f5f9;
+    }
+
+    .radar-hint-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    #empty {
+      font-size: 12.5px;
+      color: #93c5fd;
+      background: rgba(15, 34, 61, 0.65);
+      border: 1px dashed rgba(147, 197, 253, 0.3);
+      border-radius: 999px;
+      padding: 6px 16px;
+      margin-top: 8px;
+    }
+
+    /* ================= Bottom Drag & Drop Zone ================= */
+    .bottom-controls {
+      width: 100%;
+      max-width: 580px;
+      padding: 10px 16px 6px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      z-index: 10;
+    }
+
+    .dropzone-row {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+
+    #dropZone {
+      flex: 1;
+      max-width: 470px;
+      background: rgba(23, 41, 69, 0.62);
+      border: 1.5px dashed rgba(148, 163, 184, 0.35);
+      border-radius: 16px;
+      padding: 14px 18px;
+      text-align: center;
+      transition: .2s;
+      backdrop-filter: blur(10px);
+    }
+
+    #dropZone.drag,
+    #dropZone.has-staged {
+      border-color: #7dd3fc;
+      background: rgba(22, 56, 94, 0.78);
+      box-shadow: 0 0 24px rgba(56, 189, 248, 0.18);
+    }
+
+    #dropZoneTitle {
+      font-size: 14px;
+      font-weight: 700;
+      color: #f8fafc;
+    }
+
+    #dropZoneSub {
+      font-size: 11.5px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    .dropzone-actions {
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    #uploadBtn {
+      padding: 8px 20px;
+      border: 0;
+      border-radius: 999px;
+      background: var(--grad-btn);
+      color: #0f172a;
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      box-shadow: 0 4px 15px rgba(251, 191, 36, 0.25);
+      transition: transform .15s;
+    }
+
+    #uploadBtn:hover {
+      transform: translateY(-1px);
+    }
+
+    #clearStagedBtn {
+      padding: 7px 14px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 999px;
+      background: rgba(30, 41, 59, 0.8);
+      color: #e2e8f0;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .side-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .circle-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border: 1px solid var(--panel-border);
+      background: var(--panel-bg);
+      color: #cbd5e1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: .2s;
+    }
+
+    .circle-btn:hover {
+      border-color: var(--accent-blue);
+      color: #fff;
+      background: rgba(37, 65, 108, 0.9);
+    }
+
+    .circle-btn svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    /* ================= 3-Step Guide Pills ================= */
+    .steps-bar {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .step-pill {
+      background: rgba(20, 36, 62, 0.78);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: 999px;
+      padding: 6px 13px;
+      font-size: 11.5px;
+      color: #cbd5e1;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+    }
+
+    .step-arrow {
+      color: #64748b;
+      font-size: 12px;
+    }
+
+    /* ================= Inbox (Received Files & Messages) ================= */
+    #inbox {
+      width: 100%;
+      max-width: 580px;
+      padding: 8px 16px 32px;
+      z-index: 10;
+    }
+
+    #inbox h2 {
+      font-size: 14px;
+      color: #94a3b8;
+      margin: 8px 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .item {
+      background: rgba(23, 41, 69, 0.82);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 8px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      backdrop-filter: blur(8px);
+    }
+
+    .item a {
+      color: #0f172a;
+      background: var(--grad-btn);
+      padding: 6px 14px;
+      border-radius: 999px;
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 12.5px;
+      white-space: nowrap;
+    }
+
+    .item .text {
+      word-break: break-word;
+      font-size: 13.5px;
+    }
+
+    /* ================= Confirm Modal & Toast ================= */
+    #confirmModal {
+      position: fixed;
+      inset: 0;
+      background: rgba(8, 18, 33, 0.82);
+      backdrop-filter: blur(6px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 50;
+    }
+
+    .modal-card {
+      background: #132542;
+      border: 1px solid rgba(147, 197, 253, 0.28);
+      border-radius: 18px;
+      padding: 20px;
+      width: 100%;
+      max-width: 380px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+    }
+
+    .modal-card h3 {
+      margin: 0 0 6px;
+      font-size: 18px;
+    }
+
+    .modal-files {
+      max-height: 180px;
+      overflow-y: auto;
+      margin: 12px 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .modal-files li {
+      padding: 7px 0;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+      font-size: 13.5px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .modal-files li span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .modal-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .modal-actions button {
+      flex: 1;
+      padding: 10px;
+      border: 0;
+      border-radius: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    #acceptBtn {
+      background: #22c55e;
+      color: #0f172a;
+    }
+
+    #rejectBtn {
+      background: #ef4444;
+      color: #fff;
+    }
+
+    #toast {
+      position: fixed;
+      bottom: 22px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(30, 58, 95, 0.95);
+      border: 1px solid rgba(147, 197, 253, 0.35);
+      color: #f8fafc;
+      padding: 10px 20px;
+      border-radius: 999px;
+      font-size: 13.5px;
+      font-weight: 600;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      display: none;
+      z-index: 60;
+    }
+
+    /* ================= Responsive (Mobile) ================= */
+    @media (max-width: 640px) {
+      header {
+        grid-template-columns: 1fr auto;
+        padding: 14px 16px 6px;
+      }
+
+      .status-pill {
+        grid-column: 1 / -1;
+        order: 3;
+        width: 100%;
+        max-width: 360px;
+        justify-self: center;
+        padding: 7px 14px;
+      }
+
+      h1 { font-size: 20px; }
+      .brand-logo { width: 36px; height: 36px; }
+
+      .radar-stage {
+        width: min(350px, 94vw);
+        height: min(330px, 86vw);
+      }
+
+      .me-avatar {
+        width: 78px;
+        height: 78px;
+      }
+
+      .me-avatar-inner svg {
+        width: 38px;
+        height: 38px;
+      }
+
+      .peer-ring {
+        width: 58px;
+        height: 58px;
+      }
+
+      .peer-ring-inner svg {
+        width: 25px;
+        height: 25px;
+      }
+
+      .side-actions {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-logo">
+        <div class="brand-logo-inner">
+          <svg viewBox="0 0 24 24" fill="none" stroke="url(#brandGrad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <defs>
+              <linearGradient id="brandGrad" x1="0" y1="0" x2="24" y2="24">
+                <stop offset="0%" stop-color="#93c5fd" />
+                <stop offset="50%" stop-color="#fdba74" />
+                <stop offset="100%" stop-color="#f472b6" />
+              </linearGradient>
+            </defs>
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+            <path d="M9 15h6" />
+            <path d="M9 11h3" />
+          </svg>
+        </div>
+      </div>
+      <h1>MyDrop</h1>
+    </div>
+
+    <div class="status-pill">
+      <div class="status-pill-title">You are visible to others on this Wi-Fi</div>
+      <div class="status-pill-sub">
+        <span class="status-dot"></span>
+        <span id="roomStatus">โหมด: Wi-Fi / LAN เดียวกันอัตโนมัติ</span>
+      </div>
+    </div>
+
+    <div class="top-actions">
+      <button id="installBtn" hidden>ติดตั้งแอป</button>
+      <button type="button" class="icon-btn" id="historyBtn" title="ไฟล์และข้อความที่ได้รับ">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10" />
+          <polyline points="12 6 12 12 16 14" />
+        </svg>
+      </button>
+      <button type="button" class="icon-btn" id="roomToggleBtn" title="ตั้งค่ารหัสห้อง">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <div id="roomPanel" hidden>
+    <form id="roomForm">
+      <input id="roomInput" type="text" placeholder="รหัสห้อง (ว่าง = Wi-Fi เดียวกัน)" autocomplete="off" />
+      <button type="submit">เข้าห้อง</button>
+      <button type="button" id="leaveRoomBtn" class="alt" hidden>กลับห้อง Wi-Fi</button>
+    </form>
+  </div>
+
+  <div id="shareBanner">
+    <div id="shareInfo"></div>
+    <button id="clearShareBtn" type="button">ยกเลิก</button>
+  </div>
+
+  <!-- ================= Radar Area ================= -->
+  <section class="radar-section">
+    <svg class="wave-bg" viewBox="0 0 900 120" fill="none" preserveAspectRatio="none">
+      <path d="M0 60 H120 L135 30 L150 95 L168 15 L185 105 L202 42 L216 75 L230 60 H670 L685 38 L700 92 L718 18 L735 102 L752 35 L768 72 L782 60 H900"
+            stroke="rgba(125, 211, 252, 0.35)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+
+    <div class="radar-stage" id="radarStage">
+      <div class="radar-rings">
+        <div class="radar-cross-h"></div>
+        <div class="radar-cross-v"></div>
+        <div class="radar-sweep"></div>
+      </div>
+
+      <!-- Center Node: Me -->
+      <div class="me-node">
+        <div class="me-avatar">
+          <div class="me-avatar-inner">
+            <svg viewBox="0 0 48 48" fill="none" stroke="#f8fafc" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="9" width="28" height="20" rx="2.5" fill="rgba(15, 23, 42, 0.55)" />
+              <path d="M14 35h10" />
+              <path d="M19 29v6" />
+              <rect x="29" y="17" width="13" height="22" rx="2.5" fill="#1e293b" />
+              <line x1="34" y1="35" x2="37" y2="35" />
+            </svg>
+          </div>
+        </div>
+        <div class="me-label">Me (This Device)</div>
+        <div id="me">กำลังเชื่อมต่อ...</div>
+      </div>
+
+      <!-- Peers Around Radar -->
+      <div id="peers"></div>
+    </div>
+
+    <div class="radar-hint">
+      <div class="radar-hint-main">Drag &amp; Drop files anywhere to start</div>
+      <div class="radar-hint-sub">แตะที่อุปกรณ์เพื่อส่งไฟล์ หรือลากไฟล์มาวาง</div>
+    </div>
+    <div id="empty">เปิดหน้านี้บนอุปกรณ์อื่นใน Wi-Fi เดียวกัน หรือกด ⚙️ เพื่อใส่รหัสห้องเดียวกัน</div>
+  </section>
+
+  <!-- ================= Drag & Drop Zone + Steps ================= -->
+  <section class="bottom-controls">
+    <div class="dropzone-row">
+      <div id="dropZone">
+        <div id="dropZoneTitle">Drag and Drop Zone</div>
+        <div id="dropZoneSub">เลือกไฟล์ไว้ก่อนแล้วแตะอุปกรณ์บนเรดาร์ (หรือส่งทันทีถ้ามีเครื่องเดียว)</div>
+        <div class="dropzone-actions">
+          <button type="button" id="uploadBtn">+ Upload File</button>
+          <button type="button" id="clearStagedBtn" hidden>ยกเลิกไฟล์ที่เลือก</button>
+        </div>
+      </div>
+
+      <div class="side-actions">
+        <button type="button" class="circle-btn" id="quickAddBtn" title="เลือกไฟล์">+
+        </button>
+        <button type="button" class="circle-btn" id="copyLinkBtn" title="คัดลอกลิงก์ห้อง">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="steps-bar">
+      <div class="step-pill">1. Connect to same Wi-Fi 🛜</div>
+      <span class="step-arrow">→</span>
+      <div class="step-pill">2. Click on a device 👆</div>
+      <span class="step-arrow">→</span>
+      <div class="step-pill">3. Select &amp; Send 📤</div>
+    </div>
+  </section>
+
+  <!-- ================= Received Inbox ================= -->
+  <section id="inbox">
+    <h2>ได้รับแล้ว</h2>
+    <div id="received"></div>
+  </section>
+
+  <!-- ================= Confirm Modal ================= -->
+  <div id="confirmModal">
+    <div class="modal-card">
+      <h3 id="modalTitle">มีไฟล์ส่งเข้ามา</h3>
+      <div id="modalSub" style="color:#94a3b8;font-size:14px;"></div>
+      <ul class="modal-files" id="modalFiles"></ul>
+      <div class="modal-actions">
+        <button id="rejectBtn" type="button">ปฏิเสธ</button>
+        <button id="acceptBtn" type="button">ยอมรับ</button>
+      </div>
+    </div>
+  </div>
+
+  <input type="file" id="picker" multiple hidden />
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
