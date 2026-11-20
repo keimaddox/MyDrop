@@ -690,6 +690,7 @@ function onData(peerId, data) {
       );
       const total = msg.files.reduce((sum, f) => sum + (Number.isSafeInteger(f?.size) ? f.size : 0), 0);
       if (!validFiles || total > MAX_TRANSFER_SIZE) return;
+      if (requestQueue.length >= 5) return;
       seenRequests.add(msg.transferId);
       if (seenRequests.size > 200) seenRequests.delete(seenRequests.values().next().value);
       requestQueue.push({ peerId, transferId: msg.transferId, files: msg.files });
@@ -784,6 +785,7 @@ function finishFile(peerId) {
   const f = incoming.get(peerId);
   incoming.delete(peerId);
   if (!f || f.received !== f.meta.size) return;
+  acceptedTransfers.delete(f.meta.transferId);
   const safeMime = typeof f.meta.mime === "string" && /^[\w.+-]+\/[\w.+-]+$/.test(f.meta.mime)
     ? f.meta.mime : "application/octet-stream";
   const blob = new Blob(f.chunks, { type: safeMime });
