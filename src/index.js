@@ -147,7 +147,7 @@ export default {
           if (!success) {
             return withSecurityHeaders(new Response("Too Many Requests", { status: 429 }), request);
           }
-        } catch {}
+        } catch { }
       }
 
       const rawRoom = url.searchParams.get("room");
@@ -195,7 +195,7 @@ export default {
           if (!success) {
             return withSecurityHeaders(new Response("Too Many Requests", { status: 429 }), request);
           }
-        } catch {}
+        } catch { }
       }
 
       const iceServers = [
@@ -416,7 +416,7 @@ export class Room extends DurableObject {
         ) {
           resumedIdentity = { id: att.id, name: att.name };
           old.serializeAttachment({ id: null });
-          try { old.close(1000, "replaced"); } catch {}
+          try { old.close(1000, "replaced"); } catch { }
           break;
         }
       }
@@ -536,7 +536,7 @@ export class Room extends DurableObject {
       if (state.violations >= 5) {
         this.rateState.delete(peerId);
         ws.serializeAttachment({ id: null });
-        try { ws.close(1008, reason); } catch {}
+        try { ws.close(1008, reason); } catch { }
         this.broadcastPeers(ws);
       }
     }
@@ -545,7 +545,7 @@ export class Room extends DurableObject {
   async webSocketMessage(ws, raw) {
     const from = ws.deserializeAttachment();
     if (!from?.id) {
-      try { ws.close(1008, "Unauthenticated socket"); } catch {}
+      try { ws.close(1008, "Unauthenticated socket"); } catch { }
       return;
     }
 
@@ -616,7 +616,7 @@ export class Room extends DurableObject {
             })
           );
         } catch {
-          try { peer.close(1011, "dead"); } catch {}
+          try { peer.close(1011, "dead"); } catch { }
           this.broadcastPeers(peer);
         }
         return;
@@ -656,7 +656,7 @@ export class Room extends DurableObject {
   }
 
   async webSocketClose(ws) {
-    try { ws.close(1000, "bye"); } catch {}
+    try { ws.close(1000, "bye"); } catch { }
     this.handleDisconnect(ws);
   }
 
@@ -692,7 +692,7 @@ export class Room extends DurableObject {
             peers: all.filter((p) => p.id !== me.id),
           })
         );
-      } catch {}
+      } catch { }
     }
   }
 }

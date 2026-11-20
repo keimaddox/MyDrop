@@ -161,9 +161,9 @@ function createClientInstance(name = "Client") {
       style: {},
       dataset: {},
       classList: {
-        add() {},
-        remove() {},
-        toggle() {},
+        add() { },
+        remove() { },
+        toggle() { },
       },
       hidden: false,
       value: "",
@@ -179,14 +179,14 @@ function createClientInstance(name = "Client") {
       prepend(node) {
         this.children.unshift(node);
       },
-      remove() {},
+      remove() { },
       querySelector() {
         return makeEl();
       },
-      addEventListener() {},
-      click() {},
-      focus() {},
-      scrollIntoView() {},
+      addEventListener() { },
+      click() { },
+      focus() { },
+      scrollIntoView() { },
     };
     return el;
   };
@@ -205,7 +205,7 @@ function createClientInstance(name = "Client") {
     File,
     URL: {
       createObjectURL: () => `blob:https://mydrop.example/${crypto.randomUUID()}`,
-      revokeObjectURL: () => {},
+      revokeObjectURL: () => { },
     },
     URLSearchParams,
     btoa: (str) => Buffer.from(str, "binary").toString("base64"),
@@ -213,7 +213,7 @@ function createClientInstance(name = "Client") {
     setTimeout,
     clearTimeout,
     setInterval: () => 1,
-    clearInterval: () => {},
+    clearInterval: () => { },
     queueMicrotask,
     sessionStorage: {
       store: new Map(),
@@ -231,17 +231,17 @@ function createClientInstance(name = "Client") {
       search: "",
     },
     history: {
-      replaceState() {},
+      replaceState() { },
     },
     navigator: {
       userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-      clipboard: { writeText: async () => {} },
+      clipboard: { writeText: async () => { } },
       storage: null,
       wakeLock: {
         async request() {
           return {
             released: false,
-            addEventListener() {},
+            addEventListener() { },
             async release() {
               this.released = true;
             },
@@ -259,10 +259,10 @@ function createClientInstance(name = "Client") {
       createElement() {
         return makeEl();
       },
-      addEventListener() {},
+      addEventListener() { },
     },
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener() { },
+    removeEventListener() { },
     indexedDB: {
       open() {
         const req = {};
@@ -300,15 +300,15 @@ function createClientInstance(name = "Client") {
       createDataChannel() {
         return {
           readyState: "connecting",
-          addEventListener() {},
-          send() {},
-          close() {},
+          addEventListener() { },
+          send() { },
+          close() { },
         };
       }
-      async setLocalDescription() {}
-      async setRemoteDescription() {}
-      async addIceCandidate() {}
-      close() {}
+      async setLocalDescription() { }
+      async setRemoteDescription() { }
+      async addIceCandidate() { }
+      close() { }
     },
     confirm: () => true,
     prompt: () => "Hello",
@@ -1535,24 +1535,24 @@ function connectTwoClientsForTransfer(sender, receiver, options = {}) {
 
       const maxSctpFrame = Math.max(16384, sctpMaxMessageSize - 128);
       sender.__test.setConn(receiverId, {
-        pc: { connectionState: "connected", signalingState: "stable", sctp: { maxMessageSize: sctpMaxMessageSize }, close() {} },
+        pc: { connectionState: "connected", signalingState: "stable", sctp: { maxMessageSize: sctpMaxMessageSize }, close() { } },
         dc: dcSender,
         chunk: sender.MyDropSecurity.SECURITY_LIMITS.INITIAL_CHUNK_SIZE,
         maxSctpFrame,
         open: Promise.resolve(),
-        resolveOpen() {},
-        rejectOpen() {},
+        resolveOpen() { },
+        rejectOpen() { },
         timer: null,
       });
 
       receiver.__test.setConn(senderId, {
-        pc: { connectionState: "connected", signalingState: "stable", sctp: { maxMessageSize: sctpMaxMessageSize }, close() {} },
+        pc: { connectionState: "connected", signalingState: "stable", sctp: { maxMessageSize: sctpMaxMessageSize }, close() { } },
         dc: dcReceiver,
         chunk: receiver.MyDropSecurity.SECURITY_LIMITS.INITIAL_CHUNK_SIZE,
         maxSctpFrame,
         open: Promise.resolve(),
-        resolveOpen() {},
-        rejectOpen() {},
+        resolveOpen() { },
+        rejectOpen() { },
         timer: null,
       });
 
