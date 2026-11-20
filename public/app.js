@@ -1,10 +1,60 @@
+// ================= Security Configuration & Configurable Limits =================
+const SECURITY_LIMITS = {
+  MAX_FILES_PER_TRANSFER: 10,
+  MAX_FILE_SIZE: 50 * 1024 * 1024,        // 50 MB per file
+  MAX_TOTAL_TRANSFER_SIZE: 100 * 1024 * 1024, // 100 MB total per transfer
+  MAX_TEXT_BYTES: 16 * 1024,              // 16 KB per text message
+  MAX_PENDING_REQUESTS: 5,                // Max 5 pending incoming file requests
+  MAX_FILENAME_LENGTH: 255,               // Max 255 characters per filename
+  MAX_CHUNK_SIZE: 64 * 1024,              // Max 64 KB plaintext chunk size
+  REQUEST_TIMEOUT_MS: 60000,              // 60s timeout for recipient approval
+  CHUNK_INACTIVITY_TIMEOUT_MS: 30000,     // 30s inactivity timeout during active file reception
+  E2EE_HANDSHAKE_TIMEOUT_MS: 8000,        // 8s timeout for ECDH key exchange
+  MAX_SEEN_REQUEST_IDS: 500,              // Bounded replay cache size
+  MAX_RETAINED_BLOBS: 25,                 // Max retained Object URLs before auto-revoking oldest
+  ROOM_CODE_MIN_LEN: 3,
+  ROOM_CODE_MAX_LEN: 64,
+};
+
+const ROOM_CODE_REGEX = /^[a-zA-Z0-9_-]{3,64}$/;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MIME_REGEX = /^[a-zA-Z0-9!#$&-^_]{1,64}\/[a-zA-Z0-9!#$&-^_.+]{1,128}$/;
+
+// Potentially dangerous file extensions & active MIME types requiring user warning and safe binary download
+const DANGEROUS_EXTENSIONS = new Set([
+  ".exe", ".bat", ".cmd", ".scr", ".ps1", ".psm1", ".js", ".mjs", ".cjs", ".jse",
+  ".vbs", ".vbe", ".wsf", ".wsh", ".msi", ".msp", ".hta", ".html", ".htm", ".xhtml",
+  ".svg", ".svgz", ".apk", ".app", ".dmg", ".pkg", ".sh", ".bash", ".com", ".pif",
+  ".reg", ".jar", ".lnk", ".iso", ".img", ".dll", ".sys", ".cpl", ".scf", ".url",
+]);
+
+const ACTIVE_OR_DANGEROUS_MIMES = new Set([
+  "text/html",
+  "application/xhtml+xml",
+  "image/svg+xml",
+  "text/javascript",
+  "application/javascript",
+  "application/x-javascript",
+  "application/x-msdownload",
+  "application/x-msdos-program",
+  "application/x-executable",
+  "application/x-msi",
+  "application/hta",
+  "application/x-sh",
+  "text/xml",
+  "application/xml",
+]);
+
+const WINDOWS_RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+const BIDI_AND_CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+
 let rtcConfig = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
   ],
 };
-const iceReady = fetch("/ice")
+const iceReady = fetch("/ice", { cache: "no-store" })
   .then((r) => (r.ok ? r.json() : null))
   .then((d) => { if (d?.iceServers?.length) rtcConfig = { iceServers: d.iceServers }; })
   .catch(() => {});
@@ -13,24 +63,43 @@ const MAX_BUFFER = 8 * 1024 * 1024; // คิวค้างส่งได้�
 const ICONS = { phone: "📱", tablet: "📱", desktop: "💻" };
 
 const $ = (s) => document.querySelector(s);
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 let ws;
-let myId = sessionStorage.getItem("mydrop_id") || "";
-let myName = sessionStorage.getItem("mydrop_name") || "";
-let currentRoom = new URLSearchParams(location.search).get("room") || "";
+let myId = "";
+let myName = "";
+let reconnectToken = sessionStorage.getItem("mydrop_reconnect_token") || "";
+let currentRoom = "";
 let manualClose = false;
 let reconnectTimer = null;
 let lastWsActivity = 0;
 const wsWaiters = new Set();
 let peers = [];
 
-const conns = new Map();            // peerId -> { pc, dc, polite, makingOffer, ignoreOffer, pending, chunk, open, resolveOpen, rejectOpen, timer }
-const incoming = new Map();         // peerId -> { meta, chunks, received }
-const pendingResponses = new Map(); // transferId -> { peerId, resolve, reject }
-const acceptedTransfers = new Set();
-const seenRequests = new Set();
-const peerStatus = new Map();       // peerId -> string
-const peerProgress = new Map();     // peerId -> { ratio, label }
-const requestQueue = [];
+// Initialize currentRoom from URL safely
+{
+  const rawUrlRoom = new URLSearchParams(location.search).get("room") || "";
+  if (rawUrlRoom && ROOM_CODE_REGEX.test(rawUrlRoom.trim())) {
+    currentRoom = rawUrlRoom.trim();
+  } else if (rawUrlRoom) {
+    const cleanUrl = new URL(location.href);
+    cleanUrl.searchParams.delete("room");
+    history.replaceState(null, "", cleanUrl.pathname + (cleanUrl.search || ""));
+  }
+}
+
+const conns = new Map();             // peerId -> { pc, dc, polite, makingOffer, ignoreOffer, pending, chunk, open, resolveOpen, rejectOpen, timer }
+const e2eeSessions = new Map();      // peerId -> { state, keyPair, myPubB64, myNonceB64, peerPubB64, peerNonceB64, txKey, rxKey, txSalt, rxSalt, txControlSeq, rxControlSeq, txChunkSeq, rxChunkSeq, sas, confirmHashB64, readyPromise, resolveReady, rejectReady }
+const incoming = new Map();          // peerId -> { transferId, fileIndex, meta, chunks, received, expectedChunkIndex, timer }
+const pendingResponses = new Map();  // transferId -> { peerId, resolve, reject, timer }
+const acceptedTransfers = new Map(); // transferId -> { peerId, files, nextFileIndex, totalBytes, receivedTotalBytes, createdAt, timer }
+const seenRequests = new Set();      // Bounded set of transferIds
+const peerStatus = new Map();        // peerId -> string
+const peerProgress = new Map();      // peerId -> { ratio, label }
+const peerElements = new Map();      // peerId -> HTMLElement
+const requestQueue = [];             // Bounded queue of incoming file requests
+const activeObjectUrls = [];         // Bounded list of created blob: URLs for cleanup
 let activeRequest = null;
 
 function uuid() {
@@ -38,6 +107,164 @@ function uuid() {
   return "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) =>
     (+c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (+c / 4)))).toString(16)
   );
+}
+
+// ================= Validation & Sanitization Helpers =================
+function sanitizeFilename(rawName) {
+  if (typeof rawName !== "string") return "file";
+  // Strip directory paths and control/BiDi characters
+  let clean = rawName
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop()
+    .replace(BIDI_AND_CONTROL_CHARS, "")
+    .replace(/[<>:"|?*]/g, "_")
+    .trim();
+
+  // Remove leading dots to prevent hidden dotfiles
+  clean = clean.replace(/^\.+/, "").replace(/\.+$/, "");
+  if (!clean || WINDOWS_RESERVED_NAMES.test(clean)) {
+    clean = "file_" + (clean || "unnamed");
+  }
+
+  if (clean.length > SECURITY_LIMITS.MAX_FILENAME_LENGTH) {
+    const dotIdx = clean.lastIndexOf(".");
+    const ext = dotIdx > 0 && clean.length - dotIdx <= 16 ? clean.slice(dotIdx) : "";
+    const baseLen = SECURITY_LIMITS.MAX_FILENAME_LENGTH - ext.length;
+    clean = clean.slice(0, Math.max(1, baseLen)) + ext;
+  }
+  return clean;
+}
+
+function sanitizeMimeType(rawMime) {
+  if (typeof rawMime !== "string" || !rawMime.trim()) return "application/octet-stream";
+  const trimmed = rawMime.trim().toLowerCase().split(";")[0].trim();
+  return MIME_REGEX.test(trimmed) ? trimmed : "application/octet-stream";
+}
+
+function isDangerousFile(filename, mimeType = "") {
+  const safeName = String(filename || "").toLowerCase().trim();
+  const safeMime = String(mimeType || "").toLowerCase().trim();
+
+  if (ACTIVE_OR_DANGEROUS_MIMES.has(safeMime)) return true;
+
+  // Check primary extension and trailing double extensions (e.g. "report.pdf.exe")
+  const parts = safeName.split(".");
+  if (parts.length > 1) {
+    const lastExt = "." + parts[parts.length - 1];
+    if (DANGEROUS_EXTENSIONS.has(lastExt)) return true;
+    if (parts.length > 2) {
+      const secondLastExt = "." + parts[parts.length - 2];
+      if (DANGEROUS_EXTENSIONS.has(secondLastExt) && lastExt.length <= 5) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function getSafeDownloadMime(filename, rawMime) {
+  const mime = sanitizeMimeType(rawMime);
+  if (isDangerousFile(filename, mime)) {
+    return "application/octet-stream";
+  }
+  return mime;
+}
+
+function validateOutgoingFiles(files) {
+  if (!Array.isArray(files) || files.length === 0) {
+    return { ok: false, error: "กรุณาเลือกไฟล์ก่อนส่ง" };
+  }
+  if (files.length > SECURITY_LIMITS.MAX_FILES_PER_TRANSFER) {
+    return {
+      ok: false,
+      error: `ส่งได้สูงสุด ${SECURITY_LIMITS.MAX_FILES_PER_TRANSFER} ไฟล์ต่อครั้ง`,
+    };
+  }
+  let totalBytes = 0;
+  for (const f of files) {
+    if (!(f instanceof Blob) || typeof f.size !== "number" || f.size < 0 || !Number.isSafeInteger(f.size)) {
+      return { ok: false, error: "ข้อมูลไฟล์ไม่ถูกต้อง" };
+    }
+    if (f.size > SECURITY_LIMITS.MAX_FILE_SIZE) {
+      return {
+        ok: false,
+        error: `ไฟล์ "${sanitizeFilename(f.name)}" มีขนาดเกิน ${formatSize(SECURITY_LIMITS.MAX_FILE_SIZE)}`,
+      };
+    }
+    totalBytes += f.size;
+    if (totalBytes > SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE) {
+      return {
+        ok: false,
+        error: `ขนาดไฟล์รวมเกินขีดจำกัด (${formatSize(SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE)} ต่อครั้ง)`,
+      };
+    }
+  }
+  return { ok: true, totalBytes };
+}
+
+function validateIncomingFileRequest(msg) {
+  if (!msg || typeof msg !== "object") return { ok: false, error: "Invalid request" };
+  if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) {
+    return { ok: false, error: "Invalid transferId" };
+  }
+  if (!Array.isArray(msg.files) || msg.files.length === 0 || msg.files.length > SECURITY_LIMITS.MAX_FILES_PER_TRANSFER) {
+    return { ok: false, error: "Invalid file count" };
+  }
+
+  const sanitizedFiles = [];
+  let totalBytes = 0;
+
+  for (const rawFile of msg.files) {
+    if (!rawFile || typeof rawFile !== "object") return { ok: false, error: "Malformed file entry" };
+    if (typeof rawFile.name !== "string" || rawFile.name.trim().length === 0 || rawFile.name.length > 512) {
+      return { ok: false, error: "Invalid filename" };
+    }
+    if (
+      typeof rawFile.size !== "number" ||
+      !Number.isSafeInteger(rawFile.size) ||
+      rawFile.size < 0 ||
+      rawFile.size > SECURITY_LIMITS.MAX_FILE_SIZE
+    ) {
+      return { ok: false, error: "Invalid file size" };
+    }
+    totalBytes += rawFile.size;
+    if (totalBytes > SECURITY_LIMITS.MAX_TOTAL_TRANSFER_SIZE) {
+      return { ok: false, error: "Total transfer size exceeded" };
+    }
+    const cleanName = sanitizeFilename(rawFile.name);
+    const cleanMime = sanitizeMimeType(rawFile.mime || "");
+    sanitizedFiles.push({
+      name: cleanName,
+      size: rawFile.size,
+      mime: cleanMime,
+      dangerous: isDangerousFile(cleanName, cleanMime),
+    });
+  }
+
+  return { ok: true, transferId: msg.transferId, files: sanitizedFiles, totalBytes };
+}
+
+function rememberSeenRequest(transferId) {
+  if (seenRequests.has(transferId)) return false;
+  if (seenRequests.size >= SECURITY_LIMITS.MAX_SEEN_REQUEST_IDS) {
+    const oldest = seenRequests.values().next().value;
+    if (oldest) seenRequests.delete(oldest);
+  }
+  seenRequests.add(transferId);
+  return true;
+}
+
+function generateSecureRoomCode() {
+  const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    if (i > 0 && i % 4 === 0) out += "-";
+    out += alphabet[bytes[i] % alphabet.length];
+  }
+  return out;
 }
 
 let targetPeer = null;
@@ -144,14 +371,24 @@ function updateRoomUI() {
 }
 
 function switchRoom(newRoom) {
-  currentRoom = newRoom.trim();
+  const trimmed = newRoom.trim();
+  if (trimmed && !ROOM_CODE_REGEX.test(trimmed)) {
+    toast("รหัสห้องต้องมีความยาว 3-64 ตัวอักษร (a-z, 0-9, - หรือ _)");
+    return;
+  }
+
+  currentRoom = trimmed;
+  // Clear reconnect token when switching rooms so a fresh room-scoped identity is issued
+  reconnectToken = "";
+  try { sessionStorage.removeItem("mydrop_reconnect_token"); } catch {}
+
   const url = new URL(location.href);
   if (currentRoom) url.searchParams.set("room", currentRoom);
   else url.searchParams.delete("room");
   history.replaceState(null, "", url.pathname + (url.search || ""));
   updateRoomUI();
 
-  for (const peerId of [...conns.keys()]) closeConn(peerId);
+  cleanupAllPeers("switch room");
   peers = [];
   renderPeers();
 
@@ -170,6 +407,18 @@ $("#roomForm").onsubmit = (e) => {
   $("#roomToggleBtn")?.classList.remove("active");
 };
 
+const randomRoomBtn = $("#randomRoomBtn");
+if (randomRoomBtn) {
+  randomRoomBtn.onclick = () => {
+    const secureCode = generateSecureRoomCode();
+    $("#roomInput").value = secureCode;
+    switchRoom(secureCode);
+    $("#roomPanel").hidden = true;
+    $("#roomToggleBtn")?.classList.remove("active");
+    toast(`สร้างห้องปลอดภัย: ${secureCode}`);
+  };
+}
+
 $("#leaveRoomBtn").onclick = () => {
   switchRoom("");
   $("#roomPanel").hidden = true;
@@ -187,7 +436,87 @@ $("#historyBtn").onclick = () => {
   $("#inbox")?.scrollIntoView({ behavior: "smooth" });
 };
 
-// ================= WebSocket (signaling) =================
+// ================= State & Memory Cleanup =================
+function cleanupIncomingTransfer(peerId) {
+  const f = incoming.get(peerId);
+  if (!f) return;
+  clearTimeout(f.timer);
+  f.chunks = [];
+  incoming.delete(peerId);
+  setProgress(peerId, null);
+}
+
+function cleanupAcceptedTransfer(transferId) {
+  const t = acceptedTransfers.get(transferId);
+  if (!t) return;
+  clearTimeout(t.timer);
+  acceptedTransfers.delete(transferId);
+}
+
+function cleanupPeerState(peerId) {
+  closeConn(peerId);
+
+  const sess = e2eeSessions.get(peerId);
+  e2eeInitPromises.delete(peerId);
+  if (sess) {
+    e2eeSessions.delete(peerId);
+    try { sess.rejectReady?.(new Error("peer disconnected")); } catch {}
+  }
+
+  cleanupIncomingTransfer(peerId);
+
+  for (const [transferId, pending] of pendingResponses) {
+    if (pending.peerId === peerId) {
+      clearTimeout(pending.timer);
+      pendingResponses.delete(transferId);
+      try { pending.reject(new Error("peer disconnected")); } catch {}
+    }
+  }
+
+  for (const [transferId, accepted] of acceptedTransfers) {
+    if (accepted.peerId === peerId) {
+      cleanupAcceptedTransfer(transferId);
+    }
+  }
+
+  for (let i = requestQueue.length - 1; i >= 0; i--) {
+    if (requestQueue[i].peerId === peerId) {
+      clearTimeout(requestQueue[i].expireTimer);
+      requestQueue.splice(i, 1);
+    }
+  }
+
+  if (activeRequest && activeRequest.peerId === peerId) {
+    clearTimeout(activeRequest.expireTimer);
+    activeRequest = null;
+    $("#confirmModal").style.display = "none";
+    processRequestQueue();
+  }
+
+  peerStatus.delete(peerId);
+  peerProgress.delete(peerId);
+}
+
+function cleanupAllPeers(reason = "reset") {
+  const allPeerIds = new Set([
+    ...conns.keys(),
+    ...e2eeSessions.keys(),
+    ...incoming.keys(),
+    ...peers.map((p) => p.id),
+  ]);
+  for (const pid of allPeerIds) {
+    cleanupPeerState(pid);
+  }
+}
+
+window.addEventListener("pagehide", () => {
+  while (activeObjectUrls.length > 0) {
+    const entry = activeObjectUrls.shift();
+    try { URL.revokeObjectURL(entry.url); } catch {}
+  }
+});
+
+// ================= WebSocket (signaling & encrypted relay) =================
 function notifyWsWaiters() {
   lastWsActivity = Date.now();
   for (const fn of [...wsWaiters]) fn();
@@ -202,8 +531,8 @@ function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const params = new URLSearchParams();
   if (currentRoom) params.set("room", currentRoom);
-  if (myId) params.set("id", myId);
-  if (myName) params.set("name", myName);
+  // Never send client-controlled id or name; only send server-issued secret reconnectToken if available
+  if (reconnectToken) params.set("token", reconnectToken);
   const qs = params.toString();
   const socket = new WebSocket(`${proto}://${location.host}/ws${qs ? "?" + qs : ""}`);
   ws = socket;
@@ -215,29 +544,64 @@ function connectWS() {
   socket.onmessage = (e) => {
     if (ws !== socket) return;
     notifyWsWaiters();
-    if (e.data === "pong") return;
-    const msg = JSON.parse(e.data);
+    if (typeof e.data !== "string" || e.data === "pong") return;
+
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg !== "object") return;
+
     if (msg.type === "welcome") {
-      myId = msg.id;
-      myName = msg.name;
-      try {
-        sessionStorage.setItem("mydrop_id", myId);
-        sessionStorage.setItem("mydrop_name", myName);
-      } catch {}
-      $("#me").textContent = `คุณคือ ${msg.name}`;
+      if (typeof msg.id === "string" && UUID_REGEX.test(msg.id)) {
+        const idChanged = myId && myId !== msg.id;
+        myId = msg.id;
+        myName = String(msg.name || "อุปกรณ์").slice(0, 64);
+        if (typeof msg.reconnectToken === "string") {
+          reconnectToken = msg.reconnectToken;
+          try { sessionStorage.setItem("mydrop_reconnect_token", reconnectToken); } catch {}
+        }
+        if (idChanged) {
+          // Our identity rotated; reset any stale E2EE sessions bound to the old ID
+          for (const pid of [...e2eeSessions.keys()]) {
+            const s = e2eeSessions.get(pid);
+            e2eeSessions.delete(pid);
+            try { s?.rejectReady?.(new Error("identity rotated")); } catch {}
+          }
+        }
+        $("#me").textContent = `คุณคือ ${myName}`;
+      }
     } else if (msg.type === "peers") {
-      peers = msg.peers;
+      if (!Array.isArray(msg.peers)) return;
+      const validPeers = msg.peers
+        .filter((p) => p && typeof p.id === "string" && UUID_REGEX.test(p.id) && p.id !== myId)
+        .map((p) => ({
+          id: p.id,
+          name: String(p.name || "อุปกรณ์").slice(0, 64),
+          device: ["phone", "tablet", "desktop"].includes(p.device) ? p.device : "desktop",
+        }));
+
+      const activeIds = new Set(validPeers.map((p) => p.id));
+      for (const oldPeer of peers) {
+        if (!activeIds.has(oldPeer.id)) {
+          cleanupPeerState(oldPeer.id);
+        }
+      }
+      peers = validPeers;
       renderPeers();
     } else if (msg.type === "signal") {
-      onSignal(msg.from, msg.data);
+      if (typeof msg.from === "string" && UUID_REGEX.test(msg.from) && isKnownPeer(msg.from)) {
+        onSignal(msg.from, msg.data);
+      }
     } else if (msg.type === "relay") {
-      if (msg.data?.type === "chunk") {
-        onData(msg.from, base64ToBuf(msg.data.data));
-      } else {
-        onData(msg.from, JSON.stringify(msg.data));
+      if (typeof msg.from === "string" && UUID_REGEX.test(msg.from) && isKnownPeer(msg.from)) {
+        onRelayMessage(msg.from, msg.data);
       }
     }
   };
+
   socket.onclose = () => {
     if (ws !== socket) return;
     if (manualClose) {
@@ -245,8 +609,12 @@ function connectWS() {
       return;
     }
     $("#me").textContent = "หลุดการเชื่อมต่อ กำลังลองใหม่...";
-    reconnectTimer = setTimeout(connectWS, 1000);
+    reconnectTimer = setTimeout(connectWS, 1200);
   };
+}
+
+function isKnownPeer(peerId) {
+  return peers.some((p) => p.id === peerId);
 }
 
 function waitForWsActivity(timeoutMs) {
@@ -314,7 +682,7 @@ function relaySend(to, data) {
 }
 
 function bufToBase64(buf) {
-  const bytes = new Uint8Array(buf);
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   let bin = "";
   for (let i = 0; i < bytes.length; i += 8192) {
     bin += String.fromCharCode(...bytes.subarray(i, i + 8192));
@@ -329,12 +697,476 @@ function base64ToBuf(b64) {
   return bytes.buffer;
 }
 
+function isArrayBufferLike(val) {
+  return val instanceof ArrayBuffer || Object.prototype.toString.call(val) === "[object ArrayBuffer]";
+}
+
+// ================= End-to-End Encryption (ECDH P-256 + HKDF-SHA256 + AES-256-GCM) =================
+/*
+ * E2EE Protocol Architecture:
+ * 1. Ephemeral Key Generation: Each peer generates a fresh P-256 ECDH key pair and a 16-byte CSPRNG nonce.
+ * 2. Handshake: Peers exchange `e2ee-init` and `e2ee-ack` containing uncompressed raw public keys (65 bytes) and nonces.
+ * 3. Canonical Transcript Binding:
+ *    Peers are sorted lexicographically by server-assigned UUID (`lowId < highId`).
+ *    Transcript = "MyDrop-E2EE-v1|<lowId>|<highId>|<pubLow>|<pubHigh>|<nonceLow>|<nonceHigh>"
+ *    Salt = SHA-256(Transcript)
+ * 4. HKDF-SHA256 Key Derivation:
+ *    - Low->High AES-256-GCM key + 4-byte IV prefix
+ *    - High->Low AES-256-GCM key + 4-byte IV prefix
+ *    - 6-digit SAS (Short Authentication String) verification code for out-of-band MITM protection
+ *    - Key confirmation MAC token (`e2ee-confirm`)
+ * 5. Unique Nonce Guarantee:
+ *    Each direction uses its own AES-256-GCM key and constructs a 12-byte IV:
+ *    [4-byte directional salt || 1-byte channel ID (0x01=control, 0x02=chunk, 0x03=confirm) || 7-byte monotonic big-endian counter]
+ *    A counter never wraps or repeats, guaranteeing zero AES-GCM nonce reuse.
+ */
+
+function buildDeterministicIv(salt4Bytes, channelByte, seqNumber) {
+  if (!Number.isSafeInteger(seqNumber) || seqNumber <= 0) {
+    throw new Error("Invalid sequence number for IV");
+  }
+  const iv = new Uint8Array(12);
+  iv.set(salt4Bytes.subarray(0, 4), 0);
+  iv[4] = channelByte & 0xff;
+  // Write 56-bit big-endian monotonic counter into bytes 5..11
+  let rem = BigInt(seqNumber);
+  for (let i = 11; i >= 5; i--) {
+    iv[i] = Number(rem & 0xffn);
+    rem >>= 8n;
+  }
+  return iv;
+}
+
+const e2eeInitPromises = new Map(); // peerId -> Promise<sess>
+
+async function createOrGetLocalE2EEState(peerId) {
+  let sess = e2eeSessions.get(peerId);
+  if (sess && sess.keyPair) return sess;
+  if (e2eeInitPromises.has(peerId)) return e2eeInitPromises.get(peerId);
+
+  const initPromise = (async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDH", namedCurve: "P-256" },
+      false,
+      ["deriveBits"]
+    );
+    const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+    const nonceBytes = new Uint8Array(16);
+    crypto.getRandomValues(nonceBytes);
+
+    let resolveReady, rejectReady;
+    const readyPromise = new Promise((res, rej) => {
+      resolveReady = res;
+      rejectReady = rej;
+    });
+    readyPromise.catch(() => {});
+
+    const newSess = {
+      peerId,
+      state: "init",
+      keyPair,
+      myPubB64: bufToBase64(rawPub),
+      myNonceB64: bufToBase64(nonceBytes),
+      peerPubB64: null,
+      peerNonceB64: null,
+      txKey: null,
+      rxKey: null,
+      txSalt: null,
+      rxSalt: null,
+      txControlSeq: 0,
+      rxControlSeq: 0,
+      txChunkSeq: 0,
+      rxChunkSeq: 0,
+      seenRxNonces: new Set(),
+      sas: "",
+      readyPromise,
+      resolveReady,
+      rejectReady,
+    };
+    e2eeSessions.set(peerId, newSess);
+    e2eeInitPromises.delete(peerId);
+    return newSess;
+  })();
+
+  e2eeInitPromises.set(peerId, initPromise);
+  return initPromise;
+}
+
+async function deriveSessionKeys(sess, peerId, peerPubB64, peerNonceB64) {
+  if (sess.txKey && sess.rxKey && sess.peerPubB64 === peerPubB64 && sess.peerNonceB64 === peerNonceB64) {
+    return;
+  }
+
+  const peerPubBuf = base64ToBuf(peerPubB64);
+  const peerPubKey = await crypto.subtle.importKey(
+    "raw",
+    peerPubBuf,
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    []
+  );
+
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: "ECDH", public: peerPubKey },
+    sess.keyPair.privateKey,
+    256
+  );
+
+  const hkdfBaseKey = await crypto.subtle.importKey(
+    "raw",
+    sharedBits,
+    "HKDF",
+    false,
+    ["deriveKey", "deriveBits"]
+  );
+
+  const isLow = myId < peerId;
+  const lowId = isLow ? myId : peerId;
+  const highId = isLow ? peerId : myId;
+  const pubLow = isLow ? sess.myPubB64 : peerPubB64;
+  const pubHigh = isLow ? peerPubB64 : sess.myPubB64;
+  const nonceLow = isLow ? sess.myNonceB64 : peerNonceB64;
+  const nonceHigh = isLow ? peerNonceB64 : sess.myNonceB64;
+
+  const transcriptStr = `MyDrop-E2EE-v1|${lowId}|${highId}|${pubLow}|${pubHigh}|${nonceLow}|${nonceHigh}`;
+  const transcriptBytes = textEncoder.encode(transcriptStr);
+  const transcriptHash = await crypto.subtle.digest("SHA-256", transcriptBytes);
+
+  const lowToHighKey = await crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: transcriptHash,
+      info: textEncoder.encode(`MyDrop-Key|${lowId}->${highId}`),
+    },
+    hkdfBaseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    isLow ? ["encrypt"] : ["decrypt"]
+  );
+
+  const highToLowKey = await crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: transcriptHash,
+      info: textEncoder.encode(`MyDrop-Key|${highId}->${lowId}`),
+    },
+    hkdfBaseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    isLow ? ["decrypt"] : ["encrypt"]
+  );
+
+  // Derive 8 bytes for directional IV salts (4B low->high, 4B high->low) + 4 bytes for 6-digit SAS code
+  const extraBits = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: transcriptHash,
+      info: textEncoder.encode("MyDrop-IV-And-SAS-v1"),
+    },
+    hkdfBaseKey,
+    96
+  );
+  const extraBytes = new Uint8Array(extraBits);
+  const lowSalt = extraBytes.slice(0, 4);
+  const highSalt = extraBytes.slice(4, 8);
+  const sasVal =
+    ((extraBytes[8] << 24) >>> 0) +
+    ((extraBytes[9] << 16) >>> 0) +
+    ((extraBytes[10] << 8) >>> 0) +
+    (extraBytes[11] >>> 0);
+  const sasNum = String(sasVal % 1000000).padStart(6, "0");
+
+  sess.peerPubB64 = peerPubB64;
+  sess.peerNonceB64 = peerNonceB64;
+  sess.txKey = isLow ? lowToHighKey : highToLowKey;
+  sess.rxKey = isLow ? highToLowKey : lowToHighKey;
+  sess.txSalt = isLow ? lowSalt : highSalt;
+  sess.rxSalt = isLow ? highSalt : lowSalt;
+  sess.txControlSeq = 0;
+  sess.rxControlSeq = 0;
+  sess.txChunkSeq = 0;
+  sess.rxChunkSeq = 0;
+  sess.seenRxNonces.clear();
+  sess.sas = `${sasNum.slice(0, 3)}-${sasNum.slice(3)}`;
+  sess.transcriptHashB64 = bufToBase64(transcriptHash);
+  sess.state = "established";
+  sess.resolveReady(sess);
+}
+
+function sendHandshakePacket(peerId, pkt) {
+  const c = conns.get(peerId);
+  if (c?.dc?.readyState === "open") {
+    try {
+      c.dc.send(JSON.stringify(pkt));
+      return;
+    } catch {}
+  }
+  if (ws?.readyState === 1) {
+    relaySend(peerId, pkt);
+  }
+}
+
+async function handleE2EEHandshake(peerId, data) {
+  try {
+    const sess = await createOrGetLocalE2EEState(peerId);
+    if (data.type === "e2ee-init") {
+      // If we already established a session with a different nonce, re-key cleanly
+      if (sess.state === "established" && sess.peerNonceB64 && sess.peerNonceB64 !== data.nonce) {
+        e2eeSessions.delete(peerId);
+        return handleE2EEHandshake(peerId, data);
+      }
+      await deriveSessionKeys(sess, peerId, data.pub, data.nonce);
+      sendHandshakePacket(peerId, {
+        type: "e2ee-ack",
+        pub: sess.myPubB64,
+        nonce: sess.myNonceB64,
+        peerNonce: data.nonce,
+      });
+    } else if (data.type === "e2ee-ack") {
+      if (data.peerNonce !== sess.myNonceB64) return;
+      await deriveSessionKeys(sess, peerId, data.pub, data.nonce);
+      // Send authenticated key confirmation
+      const iv = buildDeterministicIv(sess.txSalt, 0x03, 1);
+      const aad = textEncoder.encode(`MyDrop-Confirm-v1|${myId}|${peerId}`);
+      const ct = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv, additionalData: aad },
+        sess.txKey,
+        textEncoder.encode(sess.transcriptHashB64)
+      );
+      sendHandshakePacket(peerId, {
+        type: "e2ee-confirm",
+        iv: bufToBase64(iv),
+        ct: bufToBase64(ct),
+      });
+    } else if (data.type === "e2ee-confirm") {
+      if (sess.state !== "established" || !sess.rxKey) return;
+      const iv = new Uint8Array(base64ToBuf(data.iv));
+      const aad = textEncoder.encode(`MyDrop-Confirm-v1|${peerId}|${myId}`);
+      const plainBuf = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv, additionalData: aad },
+        sess.rxKey,
+        base64ToBuf(data.ct)
+      );
+      const confirmedHash = textDecoder.decode(plainBuf);
+      if (confirmedHash !== sess.transcriptHashB64) {
+        throw new Error("E2EE key confirmation mismatch");
+      }
+    }
+  } catch (err) {
+    console.error("E2EE handshake error:", err);
+    const s = e2eeSessions.get(peerId);
+    e2eeSessions.delete(peerId);
+    try { s?.rejectReady?.(err); } catch {}
+  }
+}
+
+async function ensureE2EESession(peerId) {
+  let sess = await createOrGetLocalE2EEState(peerId);
+  if (sess.state === "established" && sess.txKey && sess.rxKey) {
+    return sess;
+  }
+
+  sendHandshakePacket(peerId, {
+    type: "e2ee-init",
+    pub: sess.myPubB64,
+    nonce: sess.myNonceB64,
+  });
+
+  try {
+    await Promise.race([
+      sess.readyPromise,
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("E2EE handshake timeout")), SECURITY_LIMITS.E2EE_HANDSHAKE_TIMEOUT_MS)
+      ),
+    ]);
+    return sess;
+  } catch (err) {
+    e2eeSessions.delete(peerId);
+    throw err;
+  }
+}
+
+async function encryptControlMessage(peerId, payloadObj) {
+  const sess = await ensureE2EESession(peerId);
+  sess.txControlSeq += 1;
+  const seq = sess.txControlSeq;
+  const iv = buildDeterministicIv(sess.txSalt, 0x01, seq);
+  const aad = textEncoder.encode(`MyDrop-Ctrl-v1|${myId}|${peerId}|${seq}`);
+  const plainBytes = textEncoder.encode(JSON.stringify(payloadObj));
+  const ctBuf = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: aad },
+    sess.txKey,
+    plainBytes
+  );
+  return {
+    type: "enc-control",
+    seq,
+    iv: bufToBase64(iv),
+    ct: bufToBase64(ctBuf),
+  };
+}
+
+async function decryptControlMessage(peerId, packet) {
+  const sess = e2eeSessions.get(peerId);
+  if (!sess || sess.state !== "established" || !sess.rxKey) {
+    // Peer may have retained an old session across a fast token reconnect; trigger re-key handshake
+    createOrGetLocalE2EEState(peerId)
+      .then((newSess) =>
+        sendHandshakePacket(peerId, {
+          type: "e2ee-init",
+          pub: newSess.myPubB64,
+          nonce: newSess.myNonceB64,
+        })
+      )
+      .catch(() => {});
+    throw new Error("No established E2EE session for control message");
+  }
+  if (!Number.isSafeInteger(packet.seq) || packet.seq <= sess.rxControlSeq) {
+    throw new Error("Replayed or out-of-order control message rejected");
+  }
+  if (typeof packet.iv !== "string" || typeof packet.ct !== "string") {
+    throw new Error("Malformed encrypted control packet");
+  }
+  if (sess.seenRxNonces.has(packet.iv)) {
+    throw new Error("Duplicate nonce rejected");
+  }
+
+  const iv = new Uint8Array(base64ToBuf(packet.iv));
+  if (iv.byteLength !== 12 || iv[4] !== 0x01) {
+    throw new Error("Invalid control IV structure");
+  }
+  const aad = textEncoder.encode(`MyDrop-Ctrl-v1|${peerId}|${myId}|${packet.seq}`);
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv, additionalData: aad },
+    sess.rxKey,
+    base64ToBuf(packet.ct)
+  );
+
+  sess.rxControlSeq = packet.seq;
+  sess.seenRxNonces.add(packet.iv);
+  return JSON.parse(textDecoder.decode(plainBuf));
+}
+
+async function encryptFileChunk(peerId, transferId, fileIndex, chunkIndex, isLast, plainArrayBuffer) {
+  const sess = await ensureE2EESession(peerId);
+  sess.txChunkSeq += 1;
+  const seq = sess.txChunkSeq;
+  const iv = buildDeterministicIv(sess.txSalt, 0x02, seq);
+  const aadStr = `MyDrop-Chunk-v1|${myId}|${peerId}|${transferId}|${fileIndex}|${chunkIndex}|${isLast ? 1 : 0}`;
+  const aad = textEncoder.encode(aadStr);
+  const ctBuf = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: aad },
+    sess.txKey,
+    plainArrayBuffer
+  );
+  return {
+    type: "enc-chunk",
+    transferId,
+    fileIndex,
+    chunkIndex,
+    last: Boolean(isLast),
+    iv,
+    ctBuf,
+  };
+}
+
+// Pack encrypted chunk into a compact binary frame for WebRTC DataChannel
+// Layout: [0xE2 (1B) | flags (1B) | fileIndex (2B) | chunkIndex (4B) | iv (12B) | transferId ASCII (36B) | ciphertext+tag] = 56B header
+function packEncryptedChunkBinary(enc) {
+  const ctBytes = new Uint8Array(enc.ctBuf);
+  const frame = new Uint8Array(56 + ctBytes.byteLength);
+  const view = new DataView(frame.buffer);
+  frame[0] = 0xe2;
+  frame[1] = enc.last ? 1 : 0;
+  view.setUint16(2, enc.fileIndex, false);
+  view.setUint32(4, enc.chunkIndex, false);
+  frame.set(enc.iv, 8);
+  const idBytes = textEncoder.encode(enc.transferId);
+  frame.set(idBytes.subarray(0, 36), 20);
+  frame.set(ctBytes, 56);
+  return frame.buffer;
+}
+
+function unpackEncryptedChunkBinary(buf) {
+  if (!isArrayBufferLike(buf) || buf.byteLength < 56 + 16) {
+    throw new Error("Encrypted binary frame too short");
+  }
+  const bytes = new Uint8Array(buf);
+  if (bytes[0] !== 0xe2) {
+    throw new Error("Invalid binary frame header magic");
+  }
+  const view = new DataView(buf);
+  const last = (bytes[1] & 1) === 1;
+  const fileIndex = view.getUint16(2, false);
+  const chunkIndex = view.getUint32(4, false);
+  const iv = bytes.slice(8, 20);
+  const transferId = textDecoder.decode(bytes.subarray(20, 56));
+  const ctBuf = buf.slice(56);
+  return {
+    type: "enc-chunk",
+    transferId,
+    fileIndex,
+    chunkIndex,
+    last,
+    iv,
+    ctBuf,
+  };
+}
+
+async function decryptFileChunk(peerId, packet) {
+  const sess = e2eeSessions.get(peerId);
+  if (!sess || sess.state !== "established" || !sess.rxKey) {
+    throw new Error("No established E2EE session for chunk");
+  }
+
+  const ivBytes = packet.iv instanceof Uint8Array ? packet.iv : new Uint8Array(base64ToBuf(packet.iv));
+  if (ivBytes.byteLength !== 12 || ivBytes[4] !== 0x02) {
+    throw new Error("Invalid chunk IV structure");
+  }
+
+  // Extract 56-bit monotonic sequence number from IV bytes 5..11
+  let seqBig = 0n;
+  for (let i = 5; i < 12; i++) {
+    seqBig = (seqBig << 8n) | BigInt(ivBytes[i]);
+  }
+  const seq = Number(seqBig);
+  if (!Number.isSafeInteger(seq) || seq <= sess.rxChunkSeq) {
+    throw new Error("Replayed or out-of-order chunk IV rejected");
+  }
+
+  const ivKey = bufToBase64(ivBytes);
+  if (sess.seenRxNonces.has(ivKey)) {
+    throw new Error("Duplicate chunk nonce rejected");
+  }
+
+  const ctBuf = isArrayBufferLike(packet.ctBuf) ? packet.ctBuf : base64ToBuf(packet.ct);
+  const aadStr = `MyDrop-Chunk-v1|${peerId}|${myId}|${packet.transferId}|${packet.fileIndex}|${packet.chunkIndex}|${packet.last ? 1 : 0}`;
+  const aad = textEncoder.encode(aadStr);
+
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: ivBytes, additionalData: aad },
+    sess.rxKey,
+    ctBuf
+  );
+
+  sess.rxChunkSeq = seq;
+  sess.seenRxNonces.add(ivKey);
+  if (sess.seenRxNonces.size > 4096) {
+    const oldest = sess.seenRxNonces.values().next().value;
+    if (oldest) sess.seenRxNonces.delete(oldest);
+  }
+  return plainBuf;
+}
+
 // ================= WebRTC (Perfect Negotiation กัน Glare) =================
 function newConn(peerId) {
   const pc = new RTCPeerConnection(rtcConfig);
   let resolveOpen, rejectOpen;
   const open = new Promise((res, rej) => { resolveOpen = res; rejectOpen = rej; });
-  open.catch(() => {}); // กัน Uncaught (in promise) กรณีฝั่งรับปิดก่อนมีคน await
+  open.catch(() => {});
 
   const c = {
     pc,
@@ -359,7 +1191,6 @@ function newConn(peerId) {
     if (["failed", "closed", "disconnected"].includes(pc.connectionState)) closeConn(peerId);
   };
   pc.ondatachannel = (e) => {
-    // กรณี rollback จาก glare แล้วรับ DataChannel จากฝั่ง impolite แทน
     if (c.dc && c.dc !== e.channel) {
       c.dc.onclose = null;
       c.dc.onmessage = null;
@@ -386,7 +1217,9 @@ function setupChannel(c, peerId, dc) {
   } else {
     dc.addEventListener("open", onOpen, { once: true });
   }
-  dc.onmessage = (e) => onData(peerId, e.data);
+  dc.onmessage = (e) => {
+    onP2PMessage(peerId, e.data);
+  };
   dc.onclose = () => {
     if (c.dc === dc) closeConn(peerId);
   };
@@ -410,7 +1243,6 @@ async function flushIce(c) {
   c.pending = [];
 }
 
-// ฝั่งผู้ส่ง: สร้างการเชื่อมต่อ (หรือใช้ของเดิมที่เปิดอยู่ / กำลังเจรจาอยู่)
 async function connect(peerId) {
   await iceReady;
   let c = conns.get(peerId);
@@ -441,46 +1273,79 @@ async function connect(peerId) {
     closeConn(peerId);
     throw err;
   }
-  c.chunk = Math.min(64 * 1024, c.pc.sctp?.maxMessageSize || 16384);
+  // Reserve 128 bytes for AES-GCM tag and binary framing header
+  const sctpMax = c.pc.sctp?.maxMessageSize || 16384;
+  c.chunk = Math.min(SECURITY_LIMITS.MAX_CHUNK_SIZE, Math.max(4096, sctpMax - 128));
   return c;
 }
 
-// ลองเชื่อม WebRTC P2P ก่อน ถ้าถูกบล็อก (เช่น mDNS/NAT) ให้สลับไปใช้ WebSocket Relay อัตโนมัติ
+function createRelayTransport(peerId) {
+  return {
+    mode: "relay",
+    chunk: SECURITY_LIMITS.MAX_CHUNK_SIZE,
+    isOpen: () => ws?.readyState === 1,
+    async sendEncryptedControl(obj) {
+      const encPkt = await encryptControlMessage(peerId, obj);
+      relaySend(peerId, encPkt);
+    },
+    async sendEncryptedChunk(transferId, fileIndex, chunkIndex, isLast, plainBuf) {
+      const enc = await encryptFileChunk(peerId, transferId, fileIndex, chunkIndex, isLast, plainBuf);
+      relaySend(peerId, {
+        type: "enc-chunk",
+        transferId: enc.transferId,
+        fileIndex: enc.fileIndex,
+        chunkIndex: enc.chunkIndex,
+        last: enc.last,
+        iv: bufToBase64(enc.iv),
+        ct: bufToBase64(enc.ctBuf),
+      });
+      if (ws.bufferedAmount > 1024 * 1024) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    },
+  };
+}
+
+// ลองเชื่อม WebRTC P2P ก่อน ถ้าถูกบล็อกให้สลับไปใช้ WebSocket Relay โดยทั้งสองโหมดเข้ารหัส E2EE (AES-256-GCM)
 async function getTransport(peerId) {
   await ensureWS();
   try {
     const c = await connect(peerId);
+    setStatus(peerId, "กำลังตรวจสอบกุญแจเข้ารหัส...");
+    await ensureE2EESession(peerId);
     return {
       mode: "p2p",
       chunk: c.chunk,
       isOpen: () => c.dc?.readyState === "open",
-      sendControl: (obj) => c.dc.send(JSON.stringify(obj)),
-      async sendChunk(buf) {
+      async sendEncryptedControl(obj) {
+        const encPkt = await encryptControlMessage(peerId, obj);
+        c.dc.send(JSON.stringify(encPkt));
+      },
+      async sendEncryptedChunk(transferId, fileIndex, chunkIndex, isLast, plainBuf) {
+        const enc = await encryptFileChunk(peerId, transferId, fileIndex, chunkIndex, isLast, plainBuf);
+        const binaryFrame = packEncryptedChunkBinary(enc);
         if (c.dc.bufferedAmount > MAX_BUFFER) {
           await new Promise((r) => c.dc.addEventListener("bufferedamountlow", r, { once: true }));
         }
-        c.dc.send(buf);
+        c.dc.send(binaryFrame);
       },
     };
   } catch {
     await ensureWS();
-    setStatus(peerId, "ใช้โหมด Relay...");
-    return {
-      mode: "relay",
-      chunk: 64 * 1024,
-      isOpen: () => ws?.readyState === 1,
-      sendControl: (obj) => relaySend(peerId, obj),
-      async sendChunk(buf) {
-        relaySend(peerId, { type: "chunk", data: bufToBase64(buf) });
-        if (ws.bufferedAmount > 1024 * 1024) {
-          await new Promise((r) => setTimeout(r, 20));
-        }
-      },
-    };
+    setStatus(peerId, "กำลังสร้างช่องทาง Relay ที่เข้ารหัส...");
+    await ensureE2EESession(peerId);
+    setStatus(peerId, "โหมด Relay (เข้ารหัส E2EE)");
+    return createRelayTransport(peerId);
   }
 }
 
 async function onSignal(from, data) {
+  if (!data || typeof data !== "object") return;
+  if (data.type === "e2ee-init" || data.type === "e2ee-ack" || data.type === "e2ee-confirm") {
+    await handleE2EEHandshake(from, data);
+    return;
+  }
+
   try {
     await iceReady;
     if (data.type === "offer") {
@@ -495,7 +1360,6 @@ async function onSignal(from, data) {
       if (c.ignoreOffer) return;
 
       if (c.pc.signalingState !== "stable") {
-        // Polite peer ยอม rollback offer ของตัวเอง เพื่อรับ offer ของอีกฝั่ง
         if (c.dc && c.dc.readyState !== "open") {
           c.dc.onclose = null;
           try { c.dc.close(); } catch {}
@@ -521,7 +1385,9 @@ async function onSignal(from, data) {
           if (!c.ignoreOffer) throw err;
         }
       } else {
-        c.pending.push(data.candidate);
+        if (c.pending.length < 64) {
+          c.pending.push(data.candidate);
+        }
       }
     }
   } catch (err) {
@@ -529,55 +1395,75 @@ async function onSignal(from, data) {
   }
 }
 
-// ================= ส่งไฟล์ / ข้อความ =================
+// ================= ส่งไฟล์ / ข้อความ (E2EE) =================
 async function sendFiles(peerId, files) {
-  if (!files.length) return false;
-  let tx;
-  try {
-    setStatus(peerId, "กำลังเชื่อมต่อ...");
-    tx = await getTransport(peerId);
-  } catch {
-    setStatus(peerId, "");
-    toast("เชื่อมต่อไม่สำเร็จ");
+  if (!files || !files.length) return false;
+  if (!isKnownPeer(peerId)) {
+    toast("ไม่พบอุปกรณ์ปลายทางในห้องนี้");
     return false;
   }
 
-  // ขออนุญาตผู้รับก่อนเริ่มส่งไฟล์
+  const validation = validateOutgoingFiles(files);
+  if (!validation.ok) {
+    toast(validation.error);
+    return false;
+  }
+
+  let tx;
+  try {
+    setStatus(peerId, "กำลังเชื่อมต่ออย่างปลอดภัย...");
+    tx = await getTransport(peerId);
+  } catch {
+    setStatus(peerId, "");
+    toast("สร้างการเชื่อมต่อที่ปลอดภัยไม่สำเร็จ");
+    return false;
+  }
+
   const transferId = uuid();
   const responsePromise = new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingResponses.delete(transferId);
       reject(new Error("timeout"));
-    }, 60000);
+    }, SECURITY_LIMITS.REQUEST_TIMEOUT_MS);
     pendingResponses.set(transferId, {
       peerId,
+      timer,
       resolve: (v) => { clearTimeout(timer); resolve(v); },
       reject: (e) => { clearTimeout(timer); reject(e); },
     });
   });
 
+  const sanitizedManifest = files.map((f) => ({
+    name: sanitizeFilename(f.name),
+    size: f.size,
+    mime: sanitizeMimeType(f.type),
+  }));
+
   const reqMsg = {
     type: "file-request",
     transferId,
-    files: files.map((f) => ({ name: f.name, size: f.size, mime: f.type })),
+    files: sanitizedManifest,
   };
+
   try {
-    tx.sendControl(reqMsg);
-    if (tx.mode === "p2p" && ws?.readyState === 1) {
-      relaySend(peerId, reqMsg);
-    }
+    await tx.sendEncryptedControl(reqMsg);
   } catch {
     try {
       await ensureWS();
-      relaySend(peerId, reqMsg);
+      tx = createRelayTransport(peerId);
+      await tx.sendEncryptedControl(reqMsg);
     } catch {
+      const p = pendingResponses.get(transferId);
+      if (p) clearTimeout(p.timer);
       pendingResponses.delete(transferId);
       setStatus(peerId, "");
       toast("เชื่อมต่อไม่สำเร็จ");
       return false;
     }
   }
-  setStatus(peerId, "รอผู้รับตอบรับ...");
+
+  const sas = e2eeSessions.get(peerId)?.sas;
+  setStatus(peerId, sas ? `รอผู้รับตอบรับ (รหัส: ${sas})` : "รอผู้รับตอบรับ...");
 
   let accepted;
   try {
@@ -594,62 +1480,89 @@ async function sendFiles(peerId, files) {
     return false;
   }
 
-  for (const file of files) {
+  for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+    const file = files[fileIndex];
+    const meta = sanitizedManifest[fileIndex];
+
     if (!tx.isOpen()) {
       try {
         await ensureWS();
-        tx = {
-          mode: "relay",
-          chunk: 64 * 1024,
-          isOpen: () => ws?.readyState === 1,
-          sendControl: (obj) => relaySend(peerId, obj),
-          async sendChunk(buf) {
-            relaySend(peerId, { type: "chunk", data: bufToBase64(buf) });
-            if (ws.bufferedAmount > 1024 * 1024) {
-              await new Promise((r) => setTimeout(r, 20));
-            }
-          },
-        };
+        tx = createRelayTransport(peerId);
       } catch {
         setProgress(peerId, null);
         toast("การเชื่อมต่อหลุดระหว่างส่ง");
         return false;
       }
     }
-    tx.sendControl({
-      type: "header",
-      transferId,
-      name: file.name,
-      size: file.size,
-      mime: file.type,
-    });
+
+    const totalChunks = meta.size === 0 ? 0 : Math.ceil(meta.size / tx.chunk);
+    try {
+      await tx.sendEncryptedControl({
+        type: "header",
+        transferId,
+        fileIndex,
+        name: meta.name,
+        size: meta.size,
+        mime: meta.mime,
+        totalChunks,
+      });
+    } catch {
+      setProgress(peerId, null);
+      toast("ส่งข้อมูลหัวไฟล์ไม่สำเร็จ");
+      return false;
+    }
+
     let offset = 0;
+    let chunkIndex = 0;
     while (offset < file.size) {
       if (!tx.isOpen()) {
         setProgress(peerId, null);
         toast("การเชื่อมต่อหลุดระหว่างส่ง");
         return false;
       }
-      const buf = await file.slice(offset, offset + tx.chunk).arrayBuffer();
-      await tx.sendChunk(buf);
+      const nextOffset = Math.min(file.size, offset + tx.chunk);
+      const isLast = nextOffset >= file.size;
+      const buf = await file.slice(offset, nextOffset).arrayBuffer();
+      try {
+        await tx.sendEncryptedChunk(transferId, fileIndex, chunkIndex, isLast, buf);
+      } catch {
+        setProgress(peerId, null);
+        toast("การเข้ารหัสหรือส่งไฟล์ล้มเหลว");
+        return false;
+      }
       offset += buf.byteLength;
-      setProgress(peerId, offset / file.size, `ส่ง ${file.name}`);
+      chunkIndex += 1;
+      setProgress(peerId, offset / file.size, `เข้ารหัสและส่ง ${meta.name}`);
     }
   }
+
   setProgress(peerId, null);
-  toast(tx.mode === "relay" ? "ส่งเสร็จแล้ว (ผ่าน Relay)" : "ส่งเสร็จแล้ว");
+  toast(tx.mode === "relay" ? "ส่งเสร็จแล้ว (เข้ารหัส E2EE ผ่าน Relay)" : "ส่งเสร็จแล้ว (เข้ารหัส E2EE P2P)");
   return true;
 }
 
 async function sendText(peerId, presetText = null) {
+  if (!isKnownPeer(peerId)) {
+    toast("ไม่พบอุปกรณ์ปลายทางในห้องนี้");
+    return false;
+  }
   const text = presetText ?? prompt("พิมพ์ข้อความ:");
   if (!text) return false;
+
+  const byteLen = textEncoder.encode(text).byteLength;
+  if (byteLen > SECURITY_LIMITS.MAX_TEXT_BYTES) {
+    toast(`ข้อความยาวเกินไป (สูงสุด ${formatSize(SECURITY_LIMITS.MAX_TEXT_BYTES)})`);
+    return false;
+  }
+
   try {
     const tx = await getTransport(peerId);
-    tx.sendControl({ type: "text", text });
-    toast("ส่งข้อความแล้ว");
+    await tx.sendEncryptedControl({ type: "text", text });
+    setStatus(peerId, "");
+    toast("ส่งข้อความที่เข้ารหัสแล้ว");
     return true;
   } catch {
+    setStatus(peerId, "");
     toast("เชื่อมต่อไม่สำเร็จ");
     return false;
   }
@@ -668,37 +1581,244 @@ async function sendPendingShare(peerId) {
   }
 }
 
-// ================= รับข้อมูล & ยอมรับ/ปฏิเสธ =================
-function onData(peerId, data) {
-  if (typeof data === "string") {
-    const msg = JSON.parse(data);
-    if (msg.type === "text") {
-      addReceivedText(peerName(peerId), msg.text);
-    } else if (msg.type === "file-request") {
-      if (seenRequests.has(msg.transferId)) return;
-      seenRequests.add(msg.transferId);
-      requestQueue.push({ peerId, transferId: msg.transferId, files: msg.files || [] });
-      processRequestQueue();
-    } else if (msg.type === "file-response") {
-      const pending = pendingResponses.get(msg.transferId);
-      if (pending) {
-        pendingResponses.delete(msg.transferId);
-        pending.resolve(Boolean(msg.accepted));
+// ================= รับข้อมูลที่เข้ารหัส & ตรวจสอบความถูกต้อง =================
+async function onP2PMessage(peerId, rawData) {
+  try {
+    if (typeof rawData === "string") {
+      if (rawData.length > 131072) return;
+      const pkt = JSON.parse(rawData);
+      if (!pkt || typeof pkt !== "object") return;
+      if (pkt.type === "e2ee-init" || pkt.type === "e2ee-ack" || pkt.type === "e2ee-confirm") {
+        await handleE2EEHandshake(peerId, pkt);
+      } else if (pkt.type === "enc-control") {
+        const decryptedMsg = await decryptControlMessage(peerId, pkt);
+        onDecryptedControl(peerId, decryptedMsg);
+      } else if (pkt.type === "enc-chunk") {
+        await onEncryptedChunk(peerId, pkt);
       }
-    } else if (msg.type === "header") {
-      if (!acceptedTransfers.has(msg.transferId)) return;
-      incoming.set(peerId, { meta: msg, chunks: [], received: 0 });
-      if (msg.size === 0) finishFile(peerId);
+      return;
+    }
+
+    if (isArrayBufferLike(rawData)) {
+      if (rawData.byteLength > SECURITY_LIMITS.MAX_CHUNK_SIZE + 256) {
+        abortPeerTransfer(peerId, "ขนาด Chunk เกินขีดจำกัดที่อนุญาต");
+        return;
+      }
+      const pkt = unpackEncryptedChunkBinary(rawData);
+      await onEncryptedChunk(peerId, pkt);
+    }
+  } catch (err) {
+    console.error("P2P message error:", err);
+    abortPeerTransfer(peerId, "การตรวจสอบความปลอดภัยของข้อมูลล้มเหลว");
+  }
+}
+
+async function onRelayMessage(peerId, data) {
+  if (!data || typeof data !== "object") return;
+  try {
+    if (data.type === "e2ee-init" || data.type === "e2ee-ack" || data.type === "e2ee-confirm") {
+      await handleE2EEHandshake(peerId, data);
+    } else if (data.type === "enc-control") {
+      const decryptedMsg = await decryptControlMessage(peerId, data);
+      onDecryptedControl(peerId, decryptedMsg);
+    } else if (data.type === "enc-chunk") {
+      await onEncryptedChunk(peerId, data);
+    }
+  } catch (err) {
+    console.error("Relay message error:", err);
+    abortPeerTransfer(peerId, "การตรวจสอบความปลอดภัยของข้อมูลล้มเหลว");
+  }
+}
+
+function abortPeerTransfer(peerId, userReason) {
+  const f = incoming.get(peerId);
+  if (f) {
+    cleanupAcceptedTransfer(f.transferId);
+    cleanupIncomingTransfer(peerId);
+    if (userReason) toast(userReason);
+  }
+}
+
+function resetIncomingWatchdog(peerId, f) {
+  clearTimeout(f.timer);
+  f.timer = setTimeout(() => {
+    abortPeerTransfer(peerId, `การรับไฟล์ ${f.meta.name} หมดเวลาเชื่อมต่อ`);
+  }, SECURITY_LIMITS.CHUNK_INACTIVITY_TIMEOUT_MS);
+}
+
+function onDecryptedControl(peerId, msg) {
+  if (!msg || typeof msg !== "object") return;
+
+  if (msg.type === "text") {
+    if (typeof msg.text !== "string" || !msg.text.trim()) return;
+    if (textEncoder.encode(msg.text).byteLength > SECURITY_LIMITS.MAX_TEXT_BYTES) return;
+    addReceivedText(peerName(peerId), msg.text);
+    return;
+  }
+
+  if (msg.type === "file-request") {
+    const check = validateIncomingFileRequest(msg);
+    if (!check.ok) return;
+    if (!rememberSeenRequest(check.transferId)) return;
+
+    // Enforce maximum 5 pending incoming file requests per device
+    const pendingCount = requestQueue.length + (activeRequest ? 1 : 0);
+    if (pendingCount >= SECURITY_LIMITS.MAX_PENDING_REQUESTS) {
+      // Auto-reject when queue is full to prevent memory/UI exhaustion
+      sendEncryptedFileResponse(peerId, check.transferId, false).catch(() => {});
+      return;
+    }
+
+    const reqEntry = {
+      peerId,
+      transferId: check.transferId,
+      files: check.files,
+      totalBytes: check.totalBytes,
+      createdAt: Date.now(),
+      expireTimer: null,
+    };
+
+    reqEntry.expireTimer = setTimeout(() => {
+      const idx = requestQueue.indexOf(reqEntry);
+      if (idx !== -1) {
+        requestQueue.splice(idx, 1);
+      } else if (activeRequest === reqEntry) {
+        activeRequest = null;
+        $("#confirmModal").style.display = "none";
+        processRequestQueue();
+      }
+    }, SECURITY_LIMITS.REQUEST_TIMEOUT_MS);
+
+    requestQueue.push(reqEntry);
+    processRequestQueue();
+    return;
+  }
+
+  if (msg.type === "file-response") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const pending = pendingResponses.get(msg.transferId);
+    // Verify response actually came from the expected target peer
+    if (pending && pending.peerId === peerId) {
+      pendingResponses.delete(msg.transferId);
+      pending.resolve(Boolean(msg.accepted));
     }
     return;
   }
 
+  if (msg.type === "header") {
+    if (typeof msg.transferId !== "string" || !UUID_REGEX.test(msg.transferId)) return;
+    const approved = acceptedTransfers.get(msg.transferId);
+    if (!approved || approved.peerId !== peerId) return;
+
+    // Prevent starting a new file while another file from this peer is still incomplete
+    if (incoming.has(peerId)) {
+      abortPeerTransfer(peerId, "ลำดับการส่งไฟล์ไม่ถูกต้อง");
+      return;
+    }
+
+    const expectedFileIndex = approved.nextFileIndex;
+    if (msg.fileIndex !== expectedFileIndex || expectedFileIndex >= approved.files.length) {
+      cleanupAcceptedTransfer(msg.transferId);
+      return;
+    }
+
+    const approvedFile = approved.files[expectedFileIndex];
+    const cleanHeaderName = sanitizeFilename(msg.name);
+
+    // Strictly verify that header metadata matches what the user approved in the modal
+    if (
+      cleanHeaderName !== approvedFile.name ||
+      msg.size !== approvedFile.size ||
+      !Number.isSafeInteger(msg.size) ||
+      msg.size < 0 ||
+      msg.size > SECURITY_LIMITS.MAX_FILE_SIZE
+    ) {
+      cleanupAcceptedTransfer(msg.transferId);
+      toast("ปฏิเสธไฟล์: ข้อมูลไฟล์ไม่ตรงกับที่ขออนุญาตไว้");
+      return;
+    }
+
+    approved.nextFileIndex += 1;
+    clearTimeout(approved.timer);
+    approved.timer = setTimeout(() => {
+      cleanupAcceptedTransfer(msg.transferId);
+    }, SECURITY_LIMITS.REQUEST_TIMEOUT_MS);
+
+    const fState = {
+      transferId: msg.transferId,
+      fileIndex: expectedFileIndex,
+      meta: approvedFile,
+      chunks: [],
+      received: 0,
+      expectedChunkIndex: 0,
+      timer: null,
+    };
+    incoming.set(peerId, fState);
+
+    if (approvedFile.size === 0) {
+      finishFile(peerId);
+    } else {
+      resetIncomingWatchdog(peerId, fState);
+    }
+  }
+}
+
+async function onEncryptedChunk(peerId, packet) {
   const f = incoming.get(peerId);
   if (!f) return;
-  f.chunks.push(data);
-  f.received += data.byteLength;
-  setProgress(peerId, f.received / f.meta.size, `รับ ${f.meta.name}`);
-  if (f.received >= f.meta.size) finishFile(peerId);
+
+  if (
+    packet.transferId !== f.transferId ||
+    packet.fileIndex !== f.fileIndex ||
+    packet.chunkIndex !== f.expectedChunkIndex
+  ) {
+    abortPeerTransfer(peerId, "ตรวจพบลำดับข้อมูลไฟล์ผิดปกติหรือซ้ำซ้อน");
+    return;
+  }
+
+  const approved = acceptedTransfers.get(f.transferId);
+  if (!approved || approved.peerId !== peerId) {
+    abortPeerTransfer(peerId, "ไม่พบสิทธิ์การส่งไฟล์นี้");
+    return;
+  }
+
+  // Decrypt and verify AES-256-GCM authentication tag & AAD
+  const plainBuf = await decryptFileChunk(peerId, packet);
+
+  if (plainBuf.byteLength === 0 || plainBuf.byteLength > SECURITY_LIMITS.MAX_CHUNK_SIZE) {
+    abortPeerTransfer(peerId, "ขนาดข้อมูลย่อย (Chunk) ไม่ถูกต้อง");
+    return;
+  }
+
+  if (
+    f.received + plainBuf.byteLength > f.meta.size ||
+    approved.receivedTotalBytes + plainBuf.byteLength > approved.totalBytes
+  ) {
+    abortPeerTransfer(peerId, "ผู้ส่งส่งข้อมูลเกินขนาดไฟล์ที่ระบุไว้");
+    return;
+  }
+
+  f.chunks.push(plainBuf);
+  f.received += plainBuf.byteLength;
+  f.expectedChunkIndex += 1;
+  approved.receivedTotalBytes += plainBuf.byteLength;
+
+  if (packet.last && f.received !== f.meta.size) {
+    abortPeerTransfer(peerId, "ข้อมูลไฟล์ไม่ครบตามขนาดที่ระบุ");
+    return;
+  }
+  if (!packet.last && f.received >= f.meta.size) {
+    abortPeerTransfer(peerId, "โครงสร้างข้อมูลไฟล์ไม่ถูกต้อง");
+    return;
+  }
+
+  setProgress(peerId, f.received / f.meta.size, `รับและถอดรหัส ${f.meta.name}`);
+
+  if (packet.last && f.received === f.meta.size) {
+    finishFile(peerId);
+  } else {
+    resetIncomingWatchdog(peerId, f);
+  }
 }
 
 function formatSize(bytes) {
@@ -711,16 +1831,39 @@ function processRequestQueue() {
   if (activeRequest || requestQueue.length === 0) return;
   activeRequest = requestQueue.shift();
 
-  const total = activeRequest.files.reduce((sum, f) => sum + (f.size || 0), 0);
+  const total = activeRequest.totalBytes;
   $("#modalTitle").textContent = `${peerName(activeRequest.peerId)} ต้องการส่งไฟล์`;
   $("#modalSub").textContent = `จำนวน ${activeRequest.files.length} ไฟล์ (รวม ${formatSize(total)})`;
 
+  const secBadge = $("#modalSecurityInfo");
+  if (secBadge) {
+    const sas = e2eeSessions.get(activeRequest.peerId)?.sas;
+    secBadge.textContent = sas
+      ? `🔒 เข้ารหัส End-to-End (AES-256-GCM) • รหัสยืนยัน: ${sas}`
+      : "🔒 เข้ารหัส End-to-End (AES-256-GCM)";
+  }
+
+  const hasDangerous = activeRequest.files.some((f) => f.dangerous);
+  const warningEl = $("#modalWarning");
+  if (warningEl) {
+    if (hasDangerous) {
+      warningEl.hidden = false;
+      warningEl.textContent =
+        "⚠️ คำเตือนความปลอดภัย: มีไฟล์ที่อาจเป็นอันตราย (เช่น โปรแกรม, สคริปต์ หรือไฟล์ HTML/SVG) โปรดตรวจสอบว่าคุณรู้จักผู้ส่งก่อนกดยอมรับ";
+    } else {
+      warningEl.hidden = true;
+      warningEl.textContent = "";
+    }
+  }
+
   const list = $("#modalFiles");
-  list.innerHTML = "";
+  list.textContent = "";
   for (const f of activeRequest.files) {
     const li = document.createElement("li");
     const nameSpan = document.createElement("span");
-    nameSpan.textContent = f.name;
+    nameSpan.textContent = f.dangerous ? `⚠️ ${f.name}` : f.name;
+    if (f.dangerous) nameSpan.style.color = "#fca5a5";
+
     const sizeSpan = document.createElement("span");
     sizeSpan.textContent = formatSize(f.size || 0);
     sizeSpan.style.color = "#94a3b8";
@@ -730,27 +1873,53 @@ function processRequestQueue() {
   $("#confirmModal").style.display = "flex";
 }
 
-async function respondToActiveRequest(accepted) {
-  if (!activeRequest) return;
-  const { peerId, transferId } = activeRequest;
-  activeRequest = null;
-  $("#confirmModal").style.display = "none";
-
-  if (accepted) acceptedTransfers.add(transferId);
-  const reply = { type: "file-response", transferId, accepted };
+async function sendEncryptedFileResponse(peerId, transferId, accepted) {
+  const reply = { type: "file-response", transferId, accepted: Boolean(accepted) };
+  const encPkt = await encryptControlMessage(peerId, reply);
   const c = conns.get(peerId);
   let sentP2P = false;
   if (c?.dc?.readyState === "open") {
     try {
-      c.dc.send(JSON.stringify(reply));
+      c.dc.send(JSON.stringify(encPkt));
       sentP2P = true;
     } catch {}
   }
-  try {
+  if (!sentP2P) {
     await ensureWS();
-    relaySend(peerId, reply);
+    relaySend(peerId, encPkt);
+  }
+}
+
+async function respondToActiveRequest(accepted) {
+  if (!activeRequest) return;
+  const req = activeRequest;
+  clearTimeout(req.expireTimer);
+  activeRequest = null;
+  $("#confirmModal").style.display = "none";
+
+  const { peerId, transferId, files, totalBytes } = req;
+
+  if (accepted) {
+    const timer = setTimeout(() => {
+      cleanupAcceptedTransfer(transferId);
+    }, SECURITY_LIMITS.REQUEST_TIMEOUT_MS);
+
+    acceptedTransfers.set(transferId, {
+      peerId,
+      files,
+      nextFileIndex: 0,
+      totalBytes,
+      receivedTotalBytes: 0,
+      createdAt: Date.now(),
+      timer,
+    });
+  }
+
+  try {
+    await sendEncryptedFileResponse(peerId, transferId, accepted);
   } catch {
-    if (!sentP2P) toast("ส่งการตอบรับไม่สำเร็จ");
+    if (accepted) cleanupAcceptedTransfer(transferId);
+    toast("ส่งการตอบรับไม่สำเร็จ");
   }
   processRequestQueue();
 }
@@ -760,9 +1929,20 @@ $("#rejectBtn").onclick = () => respondToActiveRequest(false);
 
 function finishFile(peerId) {
   const f = incoming.get(peerId);
+  if (!f) return;
+  clearTimeout(f.timer);
   incoming.delete(peerId);
-  const blob = new Blob(f.chunks, { type: f.meta.mime || "application/octet-stream" });
-  addReceivedFile(peerName(peerId), f.meta.name, blob);
+
+  const approved = acceptedTransfers.get(f.transferId);
+  if (approved && approved.nextFileIndex >= approved.files.length) {
+    cleanupAcceptedTransfer(f.transferId);
+  }
+
+  const safeMime = getSafeDownloadMime(f.meta.name, f.meta.mime);
+  const blob = new Blob(f.chunks, { type: safeMime });
+  f.chunks = [];
+
+  addReceivedFile(peerName(peerId), f.meta.name, blob, f.meta.dangerous);
   setProgress(peerId, null);
   toast(`ได้รับ ${f.meta.name}`);
 }
@@ -791,6 +1971,11 @@ function updateDropZoneUI() {
 
 async function handleStagedFiles(files) {
   if (!files.length) return;
+  const check = validateOutgoingFiles(files);
+  if (!check.ok) {
+    toast(check.error);
+    return;
+  }
   if (peers.length === 1) {
     await sendFiles(peers[0].id, files);
     return;
@@ -815,7 +2000,8 @@ function peerPosition(index, total) {
 
 function renderPeers() {
   const box = $("#peers");
-  box.innerHTML = "";
+  box.textContent = "";
+  peerElements.clear();
   $("#empty").style.display = peers.length ? "none" : "block";
 
   peers.forEach((p, idx) => {
@@ -837,11 +2023,12 @@ function renderPeers() {
         <button type="button" class="peer-action-btn msg" title="ส่งข้อความ">${CHAT_SVG}</button>
         ${pendingShare ? `<button type="button" class="peer-action-btn share-send" title="ส่งที่แชร์มา">${SHARE_SVG}</button>` : ""}
       </div>
-      <div class="peer-type">${devLabel}</div>
+      <div class="peer-type"></div>
       <div class="name"></div>
       <div class="progress"><div class="bar"></div></div>
       <div class="status"></div>`;
 
+    el.querySelector(".peer-type").textContent = devLabel;
     el.querySelector(".name").textContent = `(${p.name})`;
     el.querySelector(".msg").onclick = (e) => {
       e.stopPropagation();
@@ -880,7 +2067,6 @@ function renderPeers() {
       el.querySelector(".status").textContent = st;
     }
 
-    // ลากไฟล์มาวางบนไอคอนอุปกรณ์โดยตรง
     el.ondragover = (e) => { e.preventDefault(); e.stopPropagation(); el.classList.add("drag"); };
     el.ondragleave = () => el.classList.remove("drag");
     el.ondrop = (e) => {
@@ -889,6 +2075,8 @@ function renderPeers() {
       el.classList.remove("drag");
       sendFiles(p.id, [...e.dataTransfer.files]);
     };
+
+    peerElements.set(p.id, el);
     box.appendChild(el);
   });
 }
@@ -896,7 +2084,8 @@ function renderPeers() {
 function setStatus(peerId, text) {
   if (text) peerStatus.set(peerId, text);
   else peerStatus.delete(peerId);
-  const s = document.querySelector(`[data-peer="${peerId}"] .status`);
+  const card = peerElements.get(peerId);
+  const s = card?.querySelector(".status");
   if (s) s.textContent = text;
 }
 
@@ -906,7 +2095,7 @@ function setProgress(peerId, ratio, label = "") {
   } else {
     peerProgress.set(peerId, { ratio, label });
   }
-  const card = document.querySelector(`[data-peer="${peerId}"]`);
+  const card = peerElements.get(peerId);
   if (!card) {
     if (ratio === null) setStatus(peerId, "");
     else setStatus(peerId, `${label} ${Math.round(ratio * 100)}%`);
@@ -923,16 +2112,71 @@ function setProgress(peerId, ratio, label = "") {
   setStatus(peerId, `${label} ${Math.round(ratio * 100)}%`);
 }
 
-function addReceivedFile(from, name, blob) {
+function registerObjectUrl(url, itemElement) {
+  activeObjectUrls.push({ url, itemElement });
+  while (activeObjectUrls.length > SECURITY_LIMITS.MAX_RETAINED_BLOBS) {
+    const oldest = activeObjectUrls.shift();
+    if (oldest) {
+      try { URL.revokeObjectURL(oldest.url); } catch {}
+      oldest.itemElement?.remove();
+    }
+  }
+}
+
+function revokeAndRemoveItem(url, itemElement) {
+  try { URL.revokeObjectURL(url); } catch {}
+  const idx = activeObjectUrls.findIndex((e) => e.url === url);
+  if (idx !== -1) activeObjectUrls.splice(idx, 1);
+  itemElement.remove();
+}
+
+function addReceivedFile(from, name, blob, isDangerous = false) {
+  const safeName = sanitizeFilename(name);
+  const dangerous = isDangerous || isDangerousFile(safeName, blob.type);
+
   const item = document.createElement("div");
   item.className = "item";
+
+  const infoWrap = document.createElement("div");
   const info = document.createElement("div");
-  info.textContent = `${name} (${formatSize(blob.size)}) จาก ${from}`;
+  info.textContent = `${safeName} (${formatSize(blob.size)}) จาก ${from}`;
+  infoWrap.appendChild(info);
+
+  if (dangerous) {
+    const badge = document.createElement("div");
+    badge.className = "danger-badge";
+    badge.textContent = "⚠️ ไฟล์ประเภทนี้อาจเป็นอันตราย โปรดระวังก่อนเปิดใช้งาน";
+    infoWrap.appendChild(badge);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "item-actions";
+
+  const objUrl = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
+  a.href = objUrl;
+  a.download = safeName;
+  a.rel = "noopener noreferrer";
   a.textContent = "บันทึก";
-  item.append(info, a);
+  if (dangerous) {
+    a.onclick = (e) => {
+      const ok = confirm(
+        `คำเตือน: "${safeName}" เป็นประเภทไฟล์ที่อาจทำงานได้หรือเป็นอันตรายต่อเครื่องของคุณ คุณแน่ใจหรือไม่ว่าต้องการบันทึกไฟล์นี้?`
+      );
+      if (!ok) e.preventDefault();
+    };
+  }
+
+  const dismissBtn = document.createElement("button");
+  dismissBtn.type = "button";
+  dismissBtn.className = "item-dismiss";
+  dismissBtn.title = "ลบและคืนหน่วยความจำ";
+  dismissBtn.textContent = "✕";
+  dismissBtn.onclick = () => revokeAndRemoveItem(objUrl, item);
+
+  actions.append(a, dismissBtn);
+  item.append(infoWrap, actions);
+  registerObjectUrl(objUrl, item);
   $("#received").prepend(item);
 }
 
@@ -942,11 +2186,28 @@ function addReceivedText(from, text) {
   const t = document.createElement("div");
   t.className = "text";
   t.textContent = `${from}: ${text}`;
+
+  const actions = document.createElement("div");
+  actions.className = "item-actions";
+
   const btn = document.createElement("a");
   btn.href = "#";
   btn.textContent = "คัดลอก";
-  btn.onclick = (e) => { e.preventDefault(); navigator.clipboard?.writeText(text); toast("คัดลอกแล้ว"); };
-  item.append(t, btn);
+  btn.onclick = (e) => {
+    e.preventDefault();
+    navigator.clipboard?.writeText(text);
+    toast("คัดลอกแล้ว");
+  };
+
+  const dismissBtn = document.createElement("button");
+  dismissBtn.type = "button";
+  dismissBtn.className = "item-dismiss";
+  dismissBtn.title = "ลบข้อความ";
+  dismissBtn.textContent = "✕";
+  dismissBtn.onclick = () => item.remove();
+
+  actions.append(btn, dismissBtn);
+  item.append(t, actions);
   $("#received").prepend(item);
 }
 
@@ -955,7 +2216,7 @@ function toast(text) {
   t.textContent = text;
   t.style.display = "block";
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => (t.style.display = "none"), 2500);
+  t._timer = setTimeout(() => (t.style.display = "none"), 3000);
 }
 
 $("#picker").onchange = (e) => {
@@ -1011,6 +2272,21 @@ document.body.ondrop = (e) => {
   if (e.dataTransfer?.files?.length) {
     handleStagedFiles([...e.dataTransfer.files]);
   }
+};
+
+// Expose security primitives for automated testing & audit verification
+window.MyDropSecurity = {
+  SECURITY_LIMITS,
+  sanitizeFilename,
+  sanitizeMimeType,
+  isDangerousFile,
+  getSafeDownloadMime,
+  validateOutgoingFiles,
+  validateIncomingFileRequest,
+  buildDeterministicIv,
+  packEncryptedChunkBinary,
+  unpackEncryptedChunkBinary,
+  generateSecureRoomCode,
 };
 
 updateRoomUI();

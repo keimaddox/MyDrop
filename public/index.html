@@ -789,6 +789,69 @@
       font-size: 13.5px;
     }
 
+    .item-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .item-dismiss {
+      background: rgba(51, 65, 85, 0.7);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      color: #cbd5e1;
+      border-radius: 999px;
+      width: 28px;
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 12px;
+      padding: 0;
+    }
+
+    .danger-badge {
+      display: inline-block;
+      background: rgba(239, 68, 68, 0.2);
+      border: 1px solid rgba(248, 113, 113, 0.55);
+      color: #fca5a5;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 999px;
+      margin-top: 4px;
+    }
+
+    .modal-security-badge {
+      margin-top: 8px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      background: rgba(15, 34, 61, 0.85);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      color: #7dd3fc;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .modal-warning {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(127, 29, 29, 0.55);
+      border: 1px solid rgba(248, 113, 113, 0.6);
+      color: #fecaca;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .modal-disclaimer {
+      margin-top: 8px;
+      color: #94a3b8;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
     /* ================= Confirm Modal & Toast ================= */
     #confirmModal {
       position: fixed;
@@ -983,8 +1046,9 @@
 
   <div id="roomPanel" hidden>
     <form id="roomForm">
-      <input id="roomInput" type="text" placeholder="รหัสห้อง (ว่าง = Wi-Fi เดียวกัน)" autocomplete="off" />
+      <input id="roomInput" type="text" maxlength="64" placeholder="รหัสห้อง 3-64 ตัวอักษร (ว่าง = Wi-Fi เดียวกัน)" autocomplete="off" />
       <button type="submit">เข้าห้อง</button>
+      <button type="button" id="randomRoomBtn" class="alt" title="สร้างรหัสห้องแบบสุ่มที่ปลอดภัย">สุ่มห้องปลอดภัย</button>
       <button type="button" id="leaveRoomBtn" class="alt" hidden>กลับห้อง Wi-Fi</button>
     </form>
   </div>
@@ -1080,7 +1144,12 @@
     <div class="modal-card">
       <h3 id="modalTitle">มีไฟล์ส่งเข้ามา</h3>
       <div id="modalSub" style="color:#94a3b8;font-size:14px;"></div>
+      <div id="modalSecurityInfo" class="modal-security-badge"></div>
+      <div id="modalWarning" class="modal-warning" hidden></div>
       <ul class="modal-files" id="modalFiles"></ul>
+      <div id="modalDisclaimer" class="modal-disclaimer">
+        🔒 ไฟล์ถูกเข้ารหัสแบบ End-to-End (เซิร์ฟเวอร์อ่านข้อมูลไม่ได้ และไม่มีการสแกนไวรัสอัตโนมัติ โปรดรับไฟล์จากผู้ส่งที่เชื่อถือได้เท่านั้น)
+      </div>
       <div class="modal-actions">
         <button id="rejectBtn" type="button">ปฏิเสธ</button>
         <button id="acceptBtn" type="button">ยอมรับ</button>

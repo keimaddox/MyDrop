@@ -1,4 +1,4 @@
-const CACHE_NAME = "mydrop-v3";
+const CACHE_NAME = "mydrop-v4";
 const ASSETS = [
   "/",
   "/index.html",
@@ -7,6 +7,13 @@ const ASSETS = [
   "/icon-192.png",
   "/icon-512.png"
 ];
+
+const SHARE_LIMITS = {
+  MAX_FILES: 10,
+  MAX_FILE_SIZE: 50 * 1024 * 1024,
+  MAX_TOTAL_SIZE: 100 * 1024 * 1024,
+  MAX_TEXT_CHARS: 16384,
+};
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -45,22 +52,35 @@ function saveSharedData(payload) {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
-  // รับข้อมูลจาก Web Share Target (POST /share-target)
+  // รับข้อมูลจาก Web Share Target (POST /share-target) พร้อมตรวจสอบขีดจำกัดความปลอดภัย
   if (url.pathname === "/share-target" && event.request.method === "POST") {
     event.respondWith((async () => {
       try {
         const formData = await event.request.formData();
-        const files = formData.getAll("files").filter((f) => f instanceof File && f.size >= 0 && f.name);
-        const title = formData.get("title") || "";
-        const text = formData.get("text") || "";
-        const sharedUrl = formData.get("url") || "";
-        const combinedText = [title, text, sharedUrl].filter(Boolean).join("\n");
+        const rawFiles = formData.getAll("files").filter((f) => f instanceof File && f.size >= 0 && f.name);
+        const files = [];
+        let totalBytes = 0;
 
-        await saveSharedData({
-          files,
-          text: combinedText,
-          createdAt: Date.now()
-        });
+        for (const f of rawFiles) {
+          if (files.length >= SHARE_LIMITS.MAX_FILES) break;
+          if (f.size > SHARE_LIMITS.MAX_FILE_SIZE) continue;
+          if (totalBytes + f.size > SHARE_LIMITS.MAX_TOTAL_SIZE) break;
+          files.push(f);
+          totalBytes += f.size;
+        }
+
+        const title = String(formData.get("title") || "").slice(0, 2048);
+        const text = String(formData.get("text") || "").slice(0, SHARE_LIMITS.MAX_TEXT_CHARS);
+        const sharedUrl = String(formData.get("url") || "").slice(0, 2048);
+        const combinedText = [title, text, sharedUrl].filter(Boolean).join("\n").slice(0, SHARE_LIMITS.MAX_TEXT_CHARS);
+
+        if (files.length > 0 || combinedText) {
+          await saveSharedData({
+            files,
+            text: combinedText,
+            createdAt: Date.now()
+          });
+        }
       } catch (err) {
         console.error("Share target error:", err);
       }
@@ -69,17 +89,17 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // ไม่แคช WebSocket หรือ request ข้ามโดเมน
-  if (url.pathname === "/ws" || url.origin !== self.location.origin) {
+  // ไม่แคช WebSocket, ข้อมูล TURN/ICE (/ice) หรือ request ข้ามโดเมน
+  if (url.pathname === "/ws" || url.pathname === "/ice" || url.origin !== self.location.origin) {
     return;
   }
 
-  // Network-first สำหรับไฟล์แอป เพื่อให้ได้อัปเดตล่าสุดเสมอ และ fallback เป็น cache เมื่อออฟไลน์
-  if (event.request.method === "GET") {
+  // Network-first สำหรับไฟล์ static ของแอป เพื่อให้ได้อัปเดตล่าสุดเสมอ และ fallback เป็น cache เมื่อออฟไลน์
+  if (event.request.method === "GET" && ASSETS.includes(url.pathname)) {
     event.respondWith(
       fetch(event.request)
         .then((res) => {
-          if (res.ok) {
+          if (res.ok && res.type === "basic") {
             const copy = res.clone();
             caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
           }
