@@ -839,6 +839,113 @@ await runTest("B. Security Tests", "Enforce file count, file size, total size, f
 
   // 6. Invalid MIME type format fallback
   assert.equal(sec.sanitizeMimeType("invalid-mime-type<script>"), "application/octet-stream");
+
+  // 7. Configurable limits support via configureSecurityLimits()
+  sec.configureSecurityLimits({ MAX_FILES_PER_TRANSFER: 2 });
+  assert.equal(sec.SECURITY_LIMITS.MAX_FILES_PER_TRANSFER, 2);
+  const threeFiles = Array.from({ length: 3 }, (_, i) => {
+    const b = new Blob(["x"], { type: "text/plain" });
+    b.name = `f${i}.txt`;
+    return b;
+  });
+  assert.equal(sec.validateOutgoingFiles(threeFiles).ok, false);
+  sec.configureSecurityLimits({ MAX_FILES_PER_TRANSFER: 10 });
+});
+
+await runTest("B. Security Tests", "Reject malformed file chunks, modified encrypted chunks, and expired transfers", async () => {
+  const alice = createClientInstance("Alice");
+  const bob = createClientInstance("Bob");
+  const aliceId = crypto.randomUUID();
+  const bobId = crypto.randomUUID();
+  alice.__test.setIdentity(aliceId, "Alice");
+  bob.__test.setIdentity(bobId, "Bob");
+  alice.__test.setPeers([{ id: bobId, name: "Bob", device: "desktop" }]);
+  bob.__test.setPeers([{ id: aliceId, name: "Alice", device: "desktop" }]);
+
+  alice.__test.getWs().send = (raw) => {
+    if (raw === "ping") return;
+    const msg = JSON.parse(raw);
+    if (msg.type === "relay") queueMicrotask(() => bob.__test.onRelayMessage(aliceId, msg.data));
+  };
+  bob.__test.getWs().send = (raw) => {
+    if (raw === "ping") return;
+    const msg = JSON.parse(raw);
+    if (msg.type === "relay") queueMicrotask(() => alice.__test.onRelayMessage(bobId, msg.data));
+  };
+
+  await alice.__test.ensureE2EESession(bobId);
+  await new Promise((r) => setTimeout(r, 20));
+
+  // 1. Malformed P2P binary chunk (too short & wrong magic header)
+  assert.throws(
+    () => bob.MyDropSecurity.unpackEncryptedChunkBinary(new Uint8Array(10).buffer),
+    /too short/i
+  );
+  const badMagic = new Uint8Array(80);
+  badMagic[0] = 0x00;
+  assert.throws(
+    () => bob.MyDropSecurity.unpackEncryptedChunkBinary(badMagic.buffer),
+    /Invalid binary frame header magic/i
+  );
+
+  // 2. Modified encrypted chunk during active transfer -> aborts transfer and cleans up state
+  const tid = crypto.randomUUID();
+  const req = await alice.__test.encryptControlMessage(bobId, {
+    type: "file-request",
+    transferId: tid,
+    files: [{ name: "tamper.bin", size: 16, mime: "application/octet-stream" }],
+  });
+  await bob.__test.onRelayMessage(aliceId, req);
+  await bob.__test.respondToActiveRequest(true);
+
+  const hdr = await alice.__test.encryptControlMessage(bobId, {
+    type: "header",
+    transferId: tid,
+    fileIndex: 0,
+    name: "tamper.bin",
+    size: 16,
+    mime: "application/octet-stream",
+    totalChunks: 1,
+  });
+  await bob.__test.onRelayMessage(aliceId, hdr);
+  assert.ok(bob.__test.getIncoming(aliceId));
+
+  const encChunk = await alice.__test.encryptFileChunk(
+    bobId,
+    tid,
+    0,
+    0,
+    true,
+    new Uint8Array(16).buffer
+  );
+  const ctTampered = Buffer.from(encChunk.ctBuf);
+  ctTampered[0] ^= 0xff; // Tamper with encrypted chunk bytes
+  await bob.__test.onRelayMessage(aliceId, {
+    type: "enc-chunk",
+    transferId: tid,
+    fileIndex: 0,
+    chunkIndex: 0,
+    last: true,
+    iv: Buffer.from(encChunk.iv).toString("base64"),
+    ct: ctTampered.toString("base64"),
+  });
+  // Must fail authentication and abort transfer cleanly
+  assert.equal(bob.__test.getIncoming(aliceId), undefined);
+  assert.equal(bob.__test.getAcceptedTransfer(tid), undefined);
+
+  // 3. Expired transfer timeout cleanup
+  bob.MyDropSecurity.configureSecurityLimits({ REQUEST_TIMEOUT_MS: 40 });
+  const expTid = crypto.randomUUID();
+  const expReq = await alice.__test.encryptControlMessage(bobId, {
+    type: "file-request",
+    transferId: expTid,
+    files: [{ name: "expire.txt", size: 12, mime: "text/plain" }],
+  });
+  await bob.__test.onRelayMessage(aliceId, expReq);
+  assert.ok(bob.__test.getActiveRequest());
+  await new Promise((r) => setTimeout(r, 70));
+  assert.equal(bob.__test.getActiveRequest(), null);
+  bob.MyDropSecurity.configureSecurityLimits({ REQUEST_TIMEOUT_MS: 60000 });
 });
 
 await runTest("B. Security Tests", "Reject duplicate chunks, out-of-order chunks, oversized chunks, and pending request queue overflow (> 5)", async () => {

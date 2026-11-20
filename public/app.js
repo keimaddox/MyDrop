@@ -16,7 +16,22 @@ const SECURITY_LIMITS = {
   MAX_CLIENT_CTRL_PER_10S: 60,            // Max incoming decrypted control/text messages per peer per 10s
   ROOM_CODE_MIN_LEN: 3,
   ROOM_CODE_MAX_LEN: 64,
+  ...(typeof window !== "undefined" &&
+  window.MYDROP_SECURITY_LIMITS &&
+  typeof window.MYDROP_SECURITY_LIMITS === "object"
+    ? window.MYDROP_SECURITY_LIMITS
+    : {}),
 };
+
+function configureSecurityLimits(overrides = {}) {
+  if (!overrides || typeof overrides !== "object") return { ...SECURITY_LIMITS };
+  for (const [k, v] of Object.entries(overrides)) {
+    if (Object.prototype.hasOwnProperty.call(SECURITY_LIMITS, k) && Number.isSafeInteger(v) && v > 0) {
+      SECURITY_LIMITS[k] = v;
+    }
+  }
+  return { ...SECURITY_LIMITS };
+}
 
 const ROOM_CODE_REGEX = /^[a-zA-Z0-9_-]{3,64}$/;
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -2374,6 +2389,7 @@ document.body.ondrop = (e) => {
 // Expose security primitives for automated testing & audit verification
 window.MyDropSecurity = {
   SECURITY_LIMITS,
+  configureSecurityLimits,
   sanitizeFilename,
   sanitizeMimeType,
   isDangerousFile,
